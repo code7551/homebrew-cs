@@ -4,18 +4,23 @@
 Type to search project names and chat titles. ↑↓ select, Enter resume,
 ← → change page, Esc clears the search (or quits when it is empty).
 
+"+ New session" (or Tab) opens a folder browser: ↑↓ select, → open a folder,
+← go up, Enter start a new session in the highlighted folder. Type to filter
+folders, or type a name and pick "+ create folder" to make a new one.
+
 Setup (once): add this to ~/.zshrc
   eval "$(claude-sessions init zsh)"
 
 Usage:
   cs            all chats, newest first
   cs bird       start with "bird" already in the search box
-  cs -n 20      show 20 chats per page (default 25, fewer on short windows)
+  cs --new      open straight on the folder browser for a new session
+  cs -n 20      show 20 per page (default 25, fewer on short windows)
 """
 import glob, json, math, os, select, shutil, signal, sys, termios
 import threading, time, tty, unicodedata
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 SKIP_PREFIXES = ("<command-", "<local-command", "Caveat:", "<system-reminder")
 PAGE_SIZE = 25
 PANEL_LINES = 14  # lines the panel uses besides the chat rows
@@ -182,9 +187,74 @@ def fit(text, width, keep_end=False):
     return text + " " * (width - used)
 
 
-def matches(r, words):
-    hay = (project(r) + " " + r["title"]).lower()
-    return all(w in hay for w in words)
+def projects_of(rows):
+    """One entry per project folder that still exists, most recently used first."""
+    by_dir = {}
+    for r in rows:  # newest first
+        if r["cwd"]:
+            p = by_dir.setdefault(r["cwd"], {"cwd": r["cwd"], "mtime": r["mtime"],
+                                             "count": 0})
+            p["count"] += 1
+    return [p for p in by_dir.values() if os.path.isdir(p["cwd"])]
+
+
+def haystack(r):
+    """What the search box looks through for a chat: project name and title."""
+    return (project(r) + " " + r["title"]).lower()
+
+
+def tilde(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path == home or path.startswith(home + "/") else path
+
+
+# Pinned first row of the sessions list.
+NEW_ROW = {"kind": "newsession", "cwd": "", "title": "+ New session",
+           "style": BRIGHT}
+
+
+def explorer_items(location, query, recent, start):
+    """Rows of the new-session folder browser. location None is the start
+    page: the folder `cs` was run from, then recent session folders."""
+    words = query.lower().split()
+
+    def wanted(text):
+        return all(w in text.lower() for w in words)
+
+    if location is None:
+        items = [{"kind": "here", "cwd": start, "style": BRIGHT,
+                  "label": f"✓ current folder  {tilde(start)}"}]
+        items += [{"kind": "dir", "cwd": p["cwd"], "count": p["count"],
+                   "mtime": p["mtime"], "label": f"▸ {project(p)}  {tilde(p['cwd'])}"}
+                  for p in recent if wanted(project(p) + " " + p["cwd"])]
+        return items
+    items = [{"kind": "here", "cwd": location, "label": "✓ start here", "style": BRIGHT}]
+    name = query.strip()
+    target = os.path.join(location, os.path.expanduser(name)) if name else location
+    items.append({"kind": "mkdir", "cwd": target, "style": GREEN, "label":
+                  "+ new folder (type its name)" if not name
+                  else f'↳ open "{name}"' if os.path.isdir(target)
+                  else f'+ create folder "{name}"'})
+    if location != "/":
+        items.append({"kind": "up", "cwd": os.path.dirname(location.rstrip("/")) or "/",
+                      "label": "↰ ..", "style": GRAY})
+    try:
+        with os.scandir(location) as entries:
+            names = sorted((e.name for e in entries if e.is_dir()
+                            and (not e.name.startswith(".") or query.startswith("."))),
+                           key=str.lower)
+    except OSError:
+        items.append({"kind": "none", "cwd": location, "style": WARN,
+                      "label": "can't read this folder"})
+        return items
+    known = {p["cwd"]: p for p in recent}
+    for n in names:
+        if wanted(n):
+            path = os.path.join(location, n)
+            p = known.get(path, {})
+            items.append({"kind": "dir", "cwd": path, "label": f"▸ {n}/",
+                          "count": p.get("count", 0), "mtime": p.get("mtime")})
+    return items
 
 
 def paint(text, style, hit, words):
@@ -253,16 +323,53 @@ class Loading:
             self.done.wait(0.08)
 
 
-def show_page(rows, found, total, query, page, pages, cursor, per_page, note):
+# Columns as (key, header, width, style, highlight matches, keep end when cut).
+# Width -1 sizes the column to its values; 0 takes whatever room is left.
+SESSION_COLUMNS = [("when", "WHEN", 16, GRAY, False, False),
+                   ("project", "PROJECT", -1, GREEN, True, False),
+                   ("title", "SESSION", 0, PALE, True, False)]
+FOLDER_COLUMNS = [("label", "FOLDER", 0, PALE, True, False),
+                  ("chats", "CHATS", 5, GRAY, False, False),
+                  ("when", "LAST ACTIVE", 16, GRAY, False, False)]
+
+
+def row_values(r):
+    if r.get("kind") == "newsession":
+        return {"when": r["title"], "project": "", "title": ""}
+    if "label" in r:  # a row of the folder browser
+        return {"label": r["label"],
+                "chats": f"{r['count']:>5}" if r.get("count") else "",
+                "when": when(r["mtime"]) if r.get("mtime") else ""}
+    return {"when": when(r["mtime"]), "project": project(r), "title": r["title"]}
+
+
+def size_columns(spec, drop, items, inner):
+    """Give each column its width so a row exactly fills the panel, dropping
+    the columns in `drop` (in order) when the terminal is narrow."""
+    cols = [list(c) for c in spec]
+    for c in cols:
+        if c[2] == -1:
+            c[2] = min(22, max([cells(c[1])] + [cells(row_values(r)[c[0]]) for r in items]))
+
+    def rest():
+        return inner - 5 - 2 * (len(cols) - 1) - sum(c[2] for c in cols if c[2] > 0)
+    for key in drop:
+        if rest() >= 16:
+            break
+        cols = [c for c in cols if c[0] != key]
+    for c in cols:
+        if c[2] == 0:
+            c[2] = rest()
+    return cols
+
+
+def show_page(*, view, items, spec, drop, page, pages, cursor, per_page, query,
+              count, placeholder, empty, details, hints, note):
     """Draw one page as a panel centered in the terminal."""
     cols, _ = shutil.get_terminal_size()
     inner = max(56, min(MAX_WIDTH, cols - 4))  # columns inside the border
     words = query.lower().split()
-    proj_w = min(22, max([7] + [cells(project(r)) for r in rows]))
-    title_w = inner - (4 + 16 + 2 + proj_w + 2 + 1)
-    if title_w < 16:  # narrow terminal: drop the project column
-        proj_w = 0
-        title_w = inner - (4 + 16 + 2 + 1)
+    columns = size_columns(spec, drop, items, inner)
 
     def line(*parts):
         """A line inside the border from (text, style) parts, padded to fit."""
@@ -270,58 +377,55 @@ def show_page(rows, found, total, query, page, pages, cursor, per_page, note):
         body = "".join(f"{s}{t}{RESET}" for t, s in parts)
         return f"{DARK}│{RESET}{body}{' ' * max(0, inner - used)}{DARK}│{RESET}"
 
-    def columns(when_, proj, title, styles, gap=""):
-        parts = [(fit(when_, 16), styles[0]), ("  ", gap)]
-        if proj_w:
-            parts += [(fit(proj, proj_w), styles[1]), ("  ", gap)]
-        return parts + [(fit(title, title_w), styles[2])]
-
+    # Top border: the two tabs on the left, the page on the right.
+    tab1, tab2 = "[ SESSIONS ]", "[ NEW SESSION ]"
+    style1, style2 = (SELECTED, GRAY) if view == "sessions" else (GRAY, SELECTED)
     tag = f"[ page {page + 1}/{pages} ]"
-    out = [f"{DARK}┌{'─' * (inner - cells(tag) - 1)}{GREEN}{tag}{DARK}─┐{RESET}",
-           line()]
+    fill = inner - 3 - cells(tab1) - cells(tab2) - cells(tag)
+    out = [f"{DARK}┌─{RESET}{style1}{tab1}{RESET}{DARK}─{RESET}{style2}{tab2}{RESET}"
+           f"{DARK}{'─' * fill}{GREEN}{tag}{DARK}─┐{RESET}", line()]
     pad = (inner - cells(BANNER)) // 2
     out += [line((" " * pad, ""), (BANNER, BRIGHT)), line()]
 
-    # Search box, with the match count on the right.
+    # Search box, with the count on the right.
     shown_query = query if cells(query) <= inner - 30 else fit(query, inner - 30, True)
     box = [("  ❯ ", GREEN), (shown_query, BRIGHT), ("█", BRIGHT)]
     if not query:
-        box.append((" type to search projects and titles", GRAY))
-    count = (f"{found} of {total} sessions" if query else f"{total} sessions") + "  "
-    gap = inner - sum(cells(t) for t, _ in box) - cells(count)
-    out += [line(*box, (" " * max(1, gap), ""), (count, GRAY)), line()]
+        box.append((placeholder, GRAY))
+    gap = inner - sum(cells(t) for t, _ in box) - cells(count) - 2
+    out += [line(*box, (" " * max(1, gap), ""), (count + "  ", GRAY)), line()]
 
-    out.append(line(("    ", ""), *columns("WHEN", "PROJECT", "SESSION",
-                                          (GREEN, GREEN, GREEN))))
-    out.append(line(("    ", ""), *columns("─" * 16, "─" * proj_w, "─" * title_w,
-                                          (DARK, DARK, DARK))))
-    for i, r in enumerate(rows):
+    out.append(line(("    ", ""), *[p for k, c in enumerate(columns) for p in
+                                    ([("  ", "")] if k else []) + [(fit(c[1], c[2]), GREEN)]]))
+    out.append(line(("    ", ""), *[p for k, c in enumerate(columns) for p in
+                                    ([("  ", "")] if k else []) + [("─" * c[2], DARK)]]))
+    for i, r in enumerate(items):
         sel = i == cursor
         base = SELECTED if sel else ""
         hit = HIT_SELECTED if sel else HIT
-        parts = [("  ", ""), ("▶ " if sel else "  ", base),
-                 (fit(when(r["mtime"]), 16), base or GRAY), ("  ", base)]
-        if proj_w:
-            parts += paint(fit(project(r), proj_w), base or GREEN, hit, words)
-            parts.append(("  ", base))
-        parts += paint(fit(r["title"], title_w), base or PALE, hit, words)
+        values = row_values(r)
+        parts = [("  ", ""), ("▶ " if sel else "  ", base)]
+        for k, (key, _, width, style, highlight, keep_end) in enumerate(columns):
+            if k:
+                parts.append(("  ", base))
+            text = fit(values[key], width, keep_end)
+            st = base or r.get("style") or style
+            parts += paint(text, st, hit, words) if highlight else [(text, st)]
         out.append(line(*parts, (" ", base)))
-    if not rows:
-        out.append(line(("    ", ""), (fit(f'no sessions match "{query}"', inner - 6), WARN)))
-    out += [line()] * (per_page - max(len(rows), 1) + 1)  # same height every page
+    if not items:
+        out.append(line(("    ", ""), (fit(empty, inner - 6), WARN)))
+    out += [line()] * (per_page - max(len(items), 1) + 1)  # same height every page
 
     out.append(f"{DARK}├{'─' * inner}┤{RESET}")
-    if rows:
-        r = rows[cursor]
-        out.append(line(("  dir  ", GRAY), (fit(r["cwd"], inner - 9, keep_end=True), GREEN)))
-        out.append(line(("  id   ", GRAY), (r["id"], GREEN)))
-    else:
-        out += [line(), line()]
-    out.append(line(("  ! " + note, WARN)) if note else line())
-    hints = ["↑↓ select", "⏎ resume"]
-    if pages > 1:
-        hints.append("←→ page")
-    hints.append("esc clear" if query else "esc quit")
+    for label, value in details:
+        out.append(line((f"  {label:<4} ", GRAY), (fit(value, inner - 9, keep_end=True), GREEN))
+                   if label else line())
+    out.append(line(("  ! ", WARN), (fit(note, inner - 5, keep_end=True), WARN))
+               if note else line())
+    for drop_hint in ("←→ page", "↑↓ select", "tab sessions", "tab new session"):
+        if cells("─".join(f"[{h}]" for h in hints)) <= inner - 2:
+            break  # fewer hints on a narrow terminal
+        hints = [h for h in hints if h != drop_hint]
     keys = "─".join(f"[{h}]" for h in hints)
     out.append(f"{DARK}└─{GREEN}{keys}{DARK}{'─' * (inner - cells(keys) - 1)}┘{RESET}")
     draw([(inner + 2, l) for l in out])
@@ -381,6 +485,8 @@ def key_action():
             return "prev"
         if k in ("\r", "\n"):
             return "enter"
+        if k == "\t":
+            return "tab"
         if k in ("\x7f", "\b"):
             return "backspace"
         if k == "\x15":  # Ctrl-U
@@ -397,42 +503,134 @@ def keys_waiting():
 
 def line_action():
     """Whole-line input, for when stdin is not a terminal (e.g. piped): a line
-    names a key (up, down, left, right, esc, bs, or empty for Enter);
+    names a key (up, down, left, right, tab, esc, bs, or empty for Enter);
     anything else is typed into the search box."""
     line = input()
     names = {"up": "up", "down": "down", "right": "next", "left": "prev",
-             "esc": "esc", "bs": "backspace", "": "enter"}
+             "tab": "tab", "esc": "esc", "bs": "backspace", "": "enter"}
     return names.get(line, ("text", line))
 
 
-def pick_session(all_rows, per_page, query, next_action, waiting):
-    """Search and page through chats; return the one picked, or None to quit."""
-    page, cursor, note = 0, 0, ""
+def pick(rows, recent, per_page, query, view, next_action, waiting):
+    """Search and page through chats, or browse folders for a new session
+    (Tab switches). Returns ("resume", chat), ("new", folder row), or None."""
+    start = os.getcwd()
+    location = None  # folder browser: None is its start page
+    page, cursor, note, focus = 0, 0, "", None
     while True:
         words = query.lower().split()
-        found = [r for r in all_rows if matches(r, words)] if words else all_rows
+        if view == "sessions":
+            found = ([r for r in rows if all(w in haystack(r) for w in words)]
+                     if words else [NEW_ROW] + rows)
+            count = f"{len(found)} of {len(rows)} sessions" if words else f"{len(rows)} sessions"
+        else:
+            found = explorer_items(location, query, recent, start)
+            folders = sum(1 for r in found if r["kind"] == "dir")
+            count = f"{folders} recent folders" if location is None else f"{folders} folders"
+        if focus:  # after going up, land on the folder we came from
+            at = next((i for i, r in enumerate(found) if r["cwd"] == focus
+                       and r.get("kind") == "dir"), 0)
+            page, cursor, focus = at // per_page, at % per_page, None
         pages = max(1, math.ceil(len(found) / per_page))
         page = min(page, pages - 1)
         page_rows = found[page * per_page:(page + 1) * per_page]
         cursor = max(0, min(cursor, len(page_rows) - 1))
+        sel = page_rows[cursor] if page_rows else None
+        kind_ = sel.get("kind") if sel else None
+
+        if view == "sessions":
+            spec, drop = SESSION_COLUMNS, ["project"]
+            if sel is NEW_ROW:
+                details = [("new", "pick a folder on the next screen"), ("", "")]
+            else:
+                details = [("dir", sel["cwd"]), ("id", sel["id"])] if sel else [("", ""), ("", "")]
+            hints = ["↑↓ select", "⏎ new session" if sel is NEW_ROW else "⏎ resume",
+                     "tab new session"] + (["←→ page"] if pages > 1 else [])
+            hints.append("esc clear" if query else "esc quit")
+            placeholder = " type to search projects and titles"
+        else:
+            spec, drop = FOLDER_COLUMNS, ["chats", "when"]
+            details = [("dir", sel["cwd"] if sel else ""),
+                       ("in", tilde(location) if location else "recent folders")]
+            hints = ["↑↓ select", {"up": "⏎ go up", "mkdir": "⏎ create folder"}.get(
+                kind_, "⏎ start session"), "→ open"]
+            if location is not None:
+                hints.append("← back")
+            hints += ["tab sessions", "esc clear" if query else "esc back"]
+            placeholder = (" type to filter recent folders" if location is None
+                           else " type to filter, or a name for a new folder")
         if not waiting():  # skip frames while typed/pasted keys are queued
-            show_page(page_rows, len(found), len(all_rows), query, page, pages,
-                      cursor, per_page, note)
+            show_page(view=view, items=page_rows, spec=spec, drop=drop, page=page,
+                      pages=pages, cursor=cursor, per_page=per_page, query=query,
+                      count=count, placeholder=placeholder,
+                      empty=f'no sessions match "{query}"', details=details,
+                      hints=hints, note=note)
             note = ""
         try:
             action = next_action()
         except (EOFError, KeyboardInterrupt):
             return None
         kind, text = action if isinstance(action, tuple) else (action, "")
+
+        def go(folder, came_from=None):
+            nonlocal location, query, page, cursor, focus
+            location, query, page, cursor, focus = folder, "", 0, 0, came_from
+
         if kind == "quit":
             return None
         if kind == "esc":
-            if not query:
+            if query:
+                query, page, cursor = "", 0, 0
+            elif view == "new":
+                view, page, cursor = "sessions", 0, 0
+            else:
                 return None
+        elif kind == "tab":
+            view = "new" if view == "sessions" else "sessions"
             query, page, cursor = "", 0, 0
-        elif kind == "enter":
-            if page_rows:
-                return page_rows[cursor]
+        elif kind == "enter" and sel:
+            if kind_ == "newsession":
+                view = "new"
+                go(None)
+            elif view == "sessions":
+                return ("resume", sel)
+            elif kind_ == "up":
+                go(sel["cwd"], came_from=location)
+            elif kind_ == "mkdir":
+                if not query.strip():
+                    note = "Type the new folder's name, then press Enter on this row."
+                else:
+                    try:
+                        existed = os.path.isdir(sel["cwd"])
+                        os.makedirs(sel["cwd"], exist_ok=True)
+                        go(sel["cwd"])
+                        if not existed:
+                            note = f"Created {os.path.basename(location.rstrip('/'))}/"
+                    except OSError as e:
+                        note = f"Couldn't create it: {e.strerror}"
+            elif kind_ in ("here", "dir"):
+                return ("new", sel)
+        elif kind == "next":
+            if view == "new":
+                # Open a folder (on the start page, the current folder too).
+                if kind_ in ("dir", "up") or (kind_ == "here" and location is None):
+                    go(sel["cwd"], came_from=location if kind_ == "up" else None)
+            elif page < pages - 1:
+                page, cursor = page + 1, 0
+            else:
+                note = "This is the last page."
+        elif kind == "prev":
+            if view == "new":
+                if location is None:
+                    note = "These are your recent folders. → opens one."
+                elif location == "/":
+                    go(None)
+                else:
+                    go(os.path.dirname(location.rstrip("/")) or "/", came_from=location)
+            elif page:
+                page, cursor = page - 1, 0
+            else:
+                note = "This is the first page."
         elif kind == "text":
             query, page, cursor = query + text, 0, 0
         elif kind == "backspace":
@@ -449,23 +647,21 @@ def pick_session(all_rows, per_page, query, next_action, waiting):
                 cursor -= 1
             elif page:
                 page, cursor = page - 1, per_page - 1
-        elif kind == "next":
-            if page < pages - 1:
-                page, cursor = page + 1, 0
-            else:
-                note = "This is the last page."
-        elif kind == "prev":
-            if page:
-                page, cursor = page - 1, 0
-            else:
-                note = "This is the first page."
 
 
-def launch_banner(r):
+def launch_banner(r, new=False):
     """Printed while claude starts, since a big session takes a while to load."""
+    width = max(20, min(shutil.get_terminal_size().columns, MAX_WIDTH) - 8)
+    if new:
+        return "\n".join([
+            "",
+            f"  {BRIGHT}▓▒░ NEW SESSION ░▒▓{RESET}",
+            "",
+            f"  {SELECTED}▶ {fit(project(r), width).rstrip()} {RESET}",
+            f"    {GRAY}{r['cwd']}{RESET}",
+            "", ""])
     mb = r["size"] / 1048576
     size = f"{mb:.0f} MB" if mb >= 1 else f"{max(1, r['size'] // 1024)} KB"
-    width = max(20, min(shutil.get_terminal_size().columns, MAX_WIDTH) - 8)
     wait = " (big session, this can take a few seconds)" if mb >= 50 else ""
     return "\n".join([
         "",
@@ -480,32 +676,33 @@ def launch_banner(r):
 # The `cs` shell function printed by `claude-sessions init zsh`. It has to be a
 # function, not a command, so the cd happens in your shell and you are still
 # in the project after quitting claude.
-ZSH_INIT = r'''# cs: pick a Claude Code chat, cd into its project, then resume it there.
+ZSH_INIT = r'''# cs: pick a Claude Code chat (or a project for a new one) and open it there.
 unalias cs 2>/dev/null
 function cs {
   local out dir id
   out=$(mktemp -t cs) || return
   CS_OUT=$out command claude-sessions "$@"
   { IFS= read -r dir; IFS= read -r id } < "$out"
-  [[ -n $id ]] || { rm -f "$out"; return 0 }
+  # Nothing picked: no folder and no session.
+  [[ -n $dir || -n $id ]] || { rm -f "$out"; return 0 }
   if [[ -n $dir && -d $dir ]]; then
     cd "$dir"
   elif [[ -n $dir ]]; then
-    print -u2 "cs: $dir no longer exists; resuming from $PWD"
+    print -u2 "cs: $dir no longer exists; staying in $PWD"
   fi
   # Warp only learns the folder when a command finishes. Use Warp's own
   # hooks to end the `cs` block here (in the new folder) and start a new
   # block for claude, so Warp shows the project folder while claude runs.
   if (( $+functions[warp_precmd] && $+functions[warp_preexec] )); then
     warp_precmd
-    warp_preexec "claude --resume $id"
+    warp_preexec "claude${id:+ --resume $id}"
   fi
-  tail -n +3 "$out"  # the picker's "resuming session" banner, shown while claude loads
+  tail -n +3 "$out"  # the picker's banner, shown while claude starts
   rm -f "$out"
-  claude --resume "$id"
+  # No session id means "start a new session in this folder".
+  if [[ -n $id ]]; then claude --resume "$id"; else claude; fi
 }
 '''
-
 
 def main():
     if sys.argv[1:] == ["--version"]:
@@ -516,6 +713,10 @@ def main():
         sys.stdout.write(ZSH_INIT)
         return
     args = [a for a in sys.argv[1:] if a not in ("-w", "--web")]
+    view = "sessions"
+    if "--new" in args:
+        view = "new"
+        args = [a for a in args if a != "--new"]
     # Fewer per page if the window is too short to show the whole panel.
     per_page = min(PAGE_SIZE, max(5, shutil.get_terminal_size().lines - PANEL_LINES))
     if "-n" in args:
@@ -528,7 +729,7 @@ def main():
     keys = sys.stdin.isatty()
     saved = termios.tcgetattr(sys.stdin) if keys else None
     old_winch = signal.signal(signal.SIGWINCH, on_resize) if keys else None
-    rows, r = [], None
+    rows, picked = [], None
     sys.stdout.write(ALT_ON)
     try:
         if keys:
@@ -537,9 +738,9 @@ def main():
         with Loading(progress):
             rows = load_sessions(progress)
         if rows:
-            r = pick_session(rows, per_page, query,
-                             key_action if keys else line_action,
-                             keys_waiting if keys else (lambda: False))
+            picked = pick(rows, projects_of(rows), per_page, query, view,
+                          key_action if keys else line_action,
+                          keys_waiting if keys else (lambda: False))
     except KeyboardInterrupt:
         rows = rows or [None]  # quit quietly
     finally:
@@ -550,21 +751,24 @@ def main():
         sys.stdout.flush()
     if not rows:
         print("No sessions found.")
-    if r is None:
+    if picked is None:
         return
+    kind, r = picked
+    new = kind == "new"
+    session = "" if new else r["id"]  # no session id: start a new one
     # Called from the `cs` shell function: hand the pick back so the shell
     # itself cd's into the project (a child process cannot move its parent),
-    # plus the banner to show while claude loads.
+    # plus the banner to show while claude starts.
     out = os.environ.get("CS_OUT")
     if out:
         with open(out, "w") as f:
-            f.write(f"{r['cwd']}\n{r['id']}\n{launch_banner(r)}")
+            f.write(f"{r['cwd']}\n{session}\n{launch_banner(r, new)}")
         return
     if r["cwd"] and os.path.isdir(r["cwd"]):
         os.chdir(r["cwd"])
-    sys.stdout.write(launch_banner(r))
+    sys.stdout.write(launch_banner(r, new))
     sys.stdout.flush()
-    os.execvp("claude", ["claude", "--resume", r["id"]])
+    os.execvp("claude", ["claude"] + (["--resume", session] if session else []))
 
 
 if __name__ == "__main__":

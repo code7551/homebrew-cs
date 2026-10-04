@@ -2,20 +2,21 @@
 
 A searchable terminal picker for your [Claude Code](https://claude.com/claude-code) chats.
 Run `cs`, find a chat, press Enter, and it opens in that chat's project folder.
+Or browse to any folder and start a new chat there.
 
 ```
-┌───────────────────────────────────────────────────────────────[ page 1/1 ]─┐
+┌─[ SESSIONS ]─[ NEW SESSION ]──────────────────────────────────[ page 1/1 ]─┐
 │                  ▓▒░  C L A U D E   S E S S I O N S  ░▒▓                   │
 │  ❯ kiosk█                                                3 of 50 sessions  │
 │    WHEN              PROJECT     SESSION                                   │
 │    ────────────────  ──────────  ───────────────────────────────────────── │
-│  ▶ Today 17:19       play-kiosk  Tablet kiosk check-in screen              │
-│    Yesterday 16:29   play-kiosk  Backoffice booking report                 │
+│  ▶ Today 19:30       play-kiosk  Tablet kiosk check-in screen              │
+│    Yesterday 18:40   play-kiosk  Backoffice booking report                 │
 │    30 Sep 2026       play-kiosk  Kiosk payment flow                        │
 ├────────────────────────────────────────────────────────────────────────────┤
 │  dir  /Users/you/GitHub/play-kiosk                                         │
 │  id   8f14e45f-ceea-467a-9575-a8c0b2c1d3e4                                 │
-└─[↑↓ select]─[⏎ resume]─[esc clear]─────────────────────────────────────────┘
+└─[↑↓ select]─[⏎ resume]─[tab new session]─[esc clear]───────────────────────┘
 ```
 
 ## Install
@@ -34,6 +35,8 @@ Needs zsh and the `claude` CLI. It uses the Python 3 that comes with macOS (`/us
 
 ## Use
 
+**Resume a chat** (the SESSIONS tab):
+
 | Key | Action |
 |---|---|
 | type | Search project names and chat titles |
@@ -43,10 +46,23 @@ Needs zsh and the `claude` CLI. It uses the Python 3 that comes with macOS (`/us
 | Backspace, Ctrl-U | Delete a character / clear the search |
 | Esc | Clear the search, or quit if it is empty |
 
+**Start a new chat** (pick `+ New session` at the top, or press Tab): a folder
+browser opens on your current folder and the folders of your recent chats.
+
+| Key | Action |
+|---|---|
+| Enter | Start a new session in the highlighted folder |
+| → | Open the folder |
+| ← | Go up to the parent folder |
+| type | Filter folders (start with `.` to see hidden ones) |
+| type a name, then Enter on `+ create folder` | Make a new folder and open it |
+| Esc | Clear what you typed, or go back to SESSIONS |
+
 ```sh
 cs            # all chats, newest first
 cs kiosk      # start with "kiosk" already in the search box
-cs -n 20      # 20 chats per page (default 25, fewer on short windows)
+cs --new      # go straight to the folder browser for a new session
+cs -n 20      # 20 per page (default 25, fewer on short windows)
 ```
 
 Session titles are cached in `~/.cache/claude-sessions.json`. After the
