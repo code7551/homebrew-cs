@@ -1,0 +1,571 @@
+#!/usr/bin/python3
+"""Pick a Claude Code chat session and resume it.
+
+Type to search project names and chat titles. ↑↓ select, Enter resume,
+← → change page, Esc clears the search (or quits when it is empty).
+
+Setup (once): add this to ~/.zshrc
+  eval "$(claude-sessions init zsh)"
+
+Usage:
+  cs            all chats, newest first
+  cs bird       start with "bird" already in the search box
+  cs -n 20      show 20 chats per page (default 25, fewer on short windows)
+"""
+import glob, json, math, os, select, shutil, signal, sys, termios
+import threading, time, tty, unicodedata
+
+VERSION = "1.0.0"
+SKIP_PREFIXES = ("<command-", "<local-command", "Caveat:", "<system-reminder")
+PAGE_SIZE = 25
+PANEL_LINES = 14  # lines the panel uses besides the chat rows
+MAX_WIDTH = 110  # widest the panel gets on a big terminal
+MAX_TITLE = 300  # characters of a title kept in the cache (and searched)
+CACHE = os.path.expanduser("~/.cache/claude-sessions.json")
+CACHE_VERSION = 1
+TTY = sys.stdout.isatty()
+
+
+def color(code):
+    return f"\033[{code}m" if TTY else ""
+
+
+RESET = color("0")
+BRIGHT = color("1;38;5;46")    # neon green
+GREEN = color("38;5;34")
+PALE = color("38;5;151")       # chat titles
+DARK = color("38;5;28")        # borders and rules
+GRAY = color("38;5;245")
+SELECTED = color("1;38;5;46;48;5;22")  # neon green on a dark green bar
+HIT = color("1;4;38;5;46")             # search match: neon, underlined
+HIT_SELECTED = color("1;38;5;16;48;5;46")  # search match on the selected row
+WARN = color("38;5;214")
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+BANNER = "▓▒░  C L A U D E   S E S S I O N S  ░▒▓"
+# The picker draws on the terminal's alternate screen (like less or vim), with
+# the cursor hidden, so the list is gone once you pick. Each frame starts at
+# the top-left and clears whatever it didn't overwrite, so redraws don't flicker.
+ALT_ON, ALT_OFF = "\033[?1049h\033[?25l", "\033[?25h\033[?1049l"
+HOME, EOL, EOS = "\033[H", "\033[K", "\033[J"
+if not TTY:
+    ALT_ON = ALT_OFF = HOME = EOL = EOS = ""
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                return b.get("text", "")
+    return ""
+
+
+def short(text):
+    return " ".join(text.split())[:MAX_TITLE]
+
+
+def scan(path, size, entry):
+    """Bring a session's cache entry up to date. Session logs only grow, so
+    only the lines added since the last run are read."""
+    if not entry or size < entry["offset"]:
+        entry = {"offset": 0, "custom": None, "summary": None,
+                 "first": None, "cwd": None}
+    if size == entry["offset"]:
+        return entry
+    offset = entry["offset"]
+    with open(path, "rb") as f:
+        f.seek(offset)
+        for line in f:
+            if not line.endswith(b"\n"):
+                break  # still being written; it is read next time
+            offset += len(line)
+            if not (b'"customTitle"' in line or b'"summary"' in line
+                    or (entry["first"] is None and b'"user"' in line)
+                    or entry["cwd"] is None):
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(o, dict):
+                continue
+            entry["cwd"] = entry["cwd"] or o.get("cwd")
+            if o.get("customTitle"):
+                entry["custom"] = short(o["customTitle"])
+            elif o.get("type") == "summary" and o.get("summary"):
+                entry["summary"] = entry["summary"] or short(o["summary"])
+            elif (entry["first"] is None and o.get("type") == "user"
+                  and not o.get("isMeta")):
+                t = text_of((o.get("message") or {}).get("content")).strip()
+                if t and not t.startswith(SKIP_PREFIXES):
+                    entry["first"] = short(t)
+    entry["offset"] = offset
+    return entry
+
+
+def load_sessions(progress):
+    """All titled chats, newest first. Updates progress["done"/"total"]."""
+    try:
+        with open(CACHE) as f:
+            cache = json.load(f)
+        known = cache["files"] if cache.get("version") == CACHE_VERSION else {}
+    except (OSError, ValueError, KeyError, AttributeError):
+        known = {}
+    paths = glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl"))
+    progress["total"] = len(paths)
+    fresh, rows = {}, []
+    for p in paths:
+        try:
+            st = os.stat(p)
+            entry = fresh[p] = scan(p, st.st_size, known.get(p))
+        except OSError:
+            continue
+        finally:
+            progress["done"] += 1
+        title = entry["custom"] or entry["summary"] or entry["first"]
+        if title:
+            rows.append({"id": os.path.splitext(os.path.basename(p))[0],
+                         "title": title, "cwd": entry["cwd"] or "",
+                         "mtime": st.st_mtime, "size": st.st_size})
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    try:
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        with open(CACHE + ".tmp", "w") as f:
+            json.dump({"version": CACHE_VERSION, "files": fresh}, f)
+        os.replace(CACHE + ".tmp", CACHE)
+    except OSError:
+        pass  # no cache this time; the next run reads everything again
+    return rows
+
+
+def when(ts):
+    d, today = time.localtime(ts), time.localtime()
+    days = round((time.mktime(today[:3] + (0, 0, 0) + today[6:])
+                  - time.mktime(d[:3] + (0, 0, 0) + d[6:])) / 86400)
+    if days == 0:
+        return "Today " + time.strftime("%H:%M", d)
+    if days == 1:
+        return "Yesterday " + time.strftime("%H:%M", d)
+    return time.strftime("%d %b %Y", d)
+
+
+def project(r):
+    return os.path.basename(r["cwd"].rstrip("/")) or "?"
+
+
+def cells(text):
+    """Terminal columns `text` takes: Thai vowel marks take 0, CJK and emoji 2."""
+    n = 0
+    for ch in text:
+        if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+            continue
+        n += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return n
+
+
+def fit(text, width, keep_end=False):
+    """Cut `text` to `width` columns, marking a cut with …, and pad it out.
+    keep_end keeps the end of the text instead of the start (for paths)."""
+    if width <= 0:
+        return ""
+    used = cells(text)
+    if used > width:
+        kept, used = [], 0
+        for ch in (reversed(text) if keep_end else text):
+            if used + cells(ch) > width - 1:
+                break
+            kept.append(ch)
+            used += cells(ch)
+        text = "…" + "".join(reversed(kept)) if keep_end else "".join(kept) + "…"
+        used += 1
+    return text + " " * (width - used)
+
+
+def matches(r, words):
+    hay = (project(r) + " " + r["title"]).lower()
+    return all(w in hay for w in words)
+
+
+def paint(text, style, hit, words):
+    """Split `text` into (text, style) parts with the search words highlighted."""
+    low = text.lower()
+    if not words or len(low) != len(text):
+        return [(text, style)]
+    marked = [False] * len(text)
+    for w in words:
+        at = low.find(w)
+        while at != -1:
+            marked[at:at + len(w)] = [True] * len(w)
+            at = low.find(w, at + 1)
+    parts, i = [], 0
+    while i < len(text):
+        j = i
+        while j < len(text) and marked[j] == marked[i]:
+            j += 1
+        parts.append((text[i:j], hit if marked[i] else style))
+        i = j
+    return parts
+
+
+def draw(lines):
+    """Write (width, text) lines centered in the terminal over the last frame."""
+    cols, rows = shutil.get_terminal_size()
+    out = [""] * max(0, (rows - len(lines)) // 2)
+    out += [" " * max(0, (cols - w) // 2) + t for w, t in lines]
+    sys.stdout.write(HOME + "\n".join(l + EOL for l in out) + EOS
+                     + ("" if TTY else "\n"))
+    sys.stdout.flush()
+
+
+class Loading:
+    """Animated loading screen while sessions are read. It only appears if
+    loading takes long enough to notice, so a fast (cached) start has no flash."""
+
+    def __init__(self, progress):
+        self.progress = progress
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def __enter__(self):
+        if TTY:
+            self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.done.set()
+        if self.thread.is_alive():
+            self.thread.join()
+
+    def run(self):
+        if self.done.wait(0.12):
+            return
+        frame = 0
+        while not self.done.is_set():
+            n, total = self.progress["done"], self.progress["total"] or 1
+            filled = 30 * n // total
+            bar = f"[{'█' * filled}{'░' * (30 - filled)}]  {n}/{total}"
+            status = f"{SPINNER[frame % len(SPINNER)]} indexing session logs"
+            draw([(cells(BANNER), f"{BRIGHT}{BANNER}{RESET}"), (0, ""),
+                  (cells(bar), f"{GREEN}{status:<{cells(bar)}}{RESET}"),
+                  (cells(bar), f"{DARK}{bar}{RESET}")])
+            frame += 1
+            self.done.wait(0.08)
+
+
+def show_page(rows, found, total, query, page, pages, cursor, per_page, note):
+    """Draw one page as a panel centered in the terminal."""
+    cols, _ = shutil.get_terminal_size()
+    inner = max(56, min(MAX_WIDTH, cols - 4))  # columns inside the border
+    words = query.lower().split()
+    proj_w = min(22, max([7] + [cells(project(r)) for r in rows]))
+    title_w = inner - (4 + 16 + 2 + proj_w + 2 + 1)
+    if title_w < 16:  # narrow terminal: drop the project column
+        proj_w = 0
+        title_w = inner - (4 + 16 + 2 + 1)
+
+    def line(*parts):
+        """A line inside the border from (text, style) parts, padded to fit."""
+        used = sum(cells(t) for t, _ in parts)
+        body = "".join(f"{s}{t}{RESET}" for t, s in parts)
+        return f"{DARK}│{RESET}{body}{' ' * max(0, inner - used)}{DARK}│{RESET}"
+
+    def columns(when_, proj, title, styles, gap=""):
+        parts = [(fit(when_, 16), styles[0]), ("  ", gap)]
+        if proj_w:
+            parts += [(fit(proj, proj_w), styles[1]), ("  ", gap)]
+        return parts + [(fit(title, title_w), styles[2])]
+
+    tag = f"[ page {page + 1}/{pages} ]"
+    out = [f"{DARK}┌{'─' * (inner - cells(tag) - 1)}{GREEN}{tag}{DARK}─┐{RESET}",
+           line()]
+    pad = (inner - cells(BANNER)) // 2
+    out += [line((" " * pad, ""), (BANNER, BRIGHT)), line()]
+
+    # Search box, with the match count on the right.
+    shown_query = query if cells(query) <= inner - 30 else fit(query, inner - 30, True)
+    box = [("  ❯ ", GREEN), (shown_query, BRIGHT), ("█", BRIGHT)]
+    if not query:
+        box.append((" type to search projects and titles", GRAY))
+    count = (f"{found} of {total} sessions" if query else f"{total} sessions") + "  "
+    gap = inner - sum(cells(t) for t, _ in box) - cells(count)
+    out += [line(*box, (" " * max(1, gap), ""), (count, GRAY)), line()]
+
+    out.append(line(("    ", ""), *columns("WHEN", "PROJECT", "SESSION",
+                                          (GREEN, GREEN, GREEN))))
+    out.append(line(("    ", ""), *columns("─" * 16, "─" * proj_w, "─" * title_w,
+                                          (DARK, DARK, DARK))))
+    for i, r in enumerate(rows):
+        sel = i == cursor
+        base = SELECTED if sel else ""
+        hit = HIT_SELECTED if sel else HIT
+        parts = [("  ", ""), ("▶ " if sel else "  ", base),
+                 (fit(when(r["mtime"]), 16), base or GRAY), ("  ", base)]
+        if proj_w:
+            parts += paint(fit(project(r), proj_w), base or GREEN, hit, words)
+            parts.append(("  ", base))
+        parts += paint(fit(r["title"], title_w), base or PALE, hit, words)
+        out.append(line(*parts, (" ", base)))
+    if not rows:
+        out.append(line(("    ", ""), (fit(f'no sessions match "{query}"', inner - 6), WARN)))
+    out += [line()] * (per_page - max(len(rows), 1) + 1)  # same height every page
+
+    out.append(f"{DARK}├{'─' * inner}┤{RESET}")
+    if rows:
+        r = rows[cursor]
+        out.append(line(("  dir  ", GRAY), (fit(r["cwd"], inner - 9, keep_end=True), GREEN)))
+        out.append(line(("  id   ", GRAY), (r["id"], GREEN)))
+    else:
+        out += [line(), line()]
+    out.append(line(("  ! " + note, WARN)) if note else line())
+    hints = ["↑↓ select", "⏎ resume"]
+    if pages > 1:
+        hints.append("←→ page")
+    hints.append("esc clear" if query else "esc quit")
+    keys = "─".join(f"[{h}]" for h in hints)
+    out.append(f"{DARK}└─{GREEN}{keys}{DARK}{'─' * (inner - cells(keys) - 1)}┘{RESET}")
+    draw([(inner + 2, l) for l in out])
+
+
+resized = False
+
+
+def on_resize(*_):
+    global resized
+    resized = True
+
+
+def read_key(fd):
+    """Read one key press: a character, or "up"/"down"/"left"/"right"/"esc"."""
+    ch = os.read(fd, 1)
+    if ch == b"\x1b":
+        # An arrow key arrives as ESC [ A (or ESC O A); a lone ESC has nothing after it.
+        def ready():
+            return select.select([fd], [], [], 0.05)[0]
+        if not ready():
+            return "esc"
+        if os.read(fd, 1) not in (b"[", b"O"):
+            return ""
+        seq = b""
+        while ready():
+            b = os.read(fd, 1)
+            seq += b
+            if 0x40 <= b[0] <= 0x7E:  # final byte of the sequence
+                break
+        return {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}.get(seq, "")
+    # Read the rest of a multi-byte UTF-8 character (Thai letters are 3 bytes).
+    lead = ch[0]
+    extra = 1 if 0xC0 <= lead < 0xE0 else 2 if 0xE0 <= lead < 0xF0 else 3 if 0xF0 <= lead < 0xF8 else 0
+    for _ in range(extra):
+        ch += os.read(fd, 1)
+    return ch.decode(errors="ignore")
+
+
+def key_action():
+    """Wait for a key that means something and return its action, or
+    "redraw" when the window is resized so the panel can re-center."""
+    global resized
+    fd = sys.stdin.fileno()
+    while True:
+        if not select.select([fd], [], [], 0.2)[0]:
+            if resized:
+                resized = False
+                return "redraw"
+            continue
+        k = read_key(fd)
+        if k in ("up", "down", "esc"):
+            return k
+        if k == "right":
+            return "next"
+        if k == "left":
+            return "prev"
+        if k in ("\r", "\n"):
+            return "enter"
+        if k in ("\x7f", "\b"):
+            return "backspace"
+        if k == "\x15":  # Ctrl-U
+            return "clear"
+        if k in ("\x03", "\x04"):  # Ctrl-C, Ctrl-D
+            return "quit"
+        if k and k.isprintable():
+            return ("text", k)
+
+
+def keys_waiting():
+    return bool(select.select([sys.stdin.fileno()], [], [], 0)[0])
+
+
+def line_action():
+    """Whole-line input, for when stdin is not a terminal (e.g. piped): a line
+    names a key (up, down, left, right, esc, bs, or empty for Enter);
+    anything else is typed into the search box."""
+    line = input()
+    names = {"up": "up", "down": "down", "right": "next", "left": "prev",
+             "esc": "esc", "bs": "backspace", "": "enter"}
+    return names.get(line, ("text", line))
+
+
+def pick_session(all_rows, per_page, query, next_action, waiting):
+    """Search and page through chats; return the one picked, or None to quit."""
+    page, cursor, note = 0, 0, ""
+    while True:
+        words = query.lower().split()
+        found = [r for r in all_rows if matches(r, words)] if words else all_rows
+        pages = max(1, math.ceil(len(found) / per_page))
+        page = min(page, pages - 1)
+        page_rows = found[page * per_page:(page + 1) * per_page]
+        cursor = max(0, min(cursor, len(page_rows) - 1))
+        if not waiting():  # skip frames while typed/pasted keys are queued
+            show_page(page_rows, len(found), len(all_rows), query, page, pages,
+                      cursor, per_page, note)
+            note = ""
+        try:
+            action = next_action()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        kind, text = action if isinstance(action, tuple) else (action, "")
+        if kind == "quit":
+            return None
+        if kind == "esc":
+            if not query:
+                return None
+            query, page, cursor = "", 0, 0
+        elif kind == "enter":
+            if page_rows:
+                return page_rows[cursor]
+        elif kind == "text":
+            query, page, cursor = query + text, 0, 0
+        elif kind == "backspace":
+            query, page, cursor = query[:-1], 0, 0
+        elif kind == "clear":
+            query, page, cursor = "", 0, 0
+        elif kind == "down":
+            if cursor < len(page_rows) - 1:
+                cursor += 1
+            elif page < pages - 1:
+                page, cursor = page + 1, 0
+        elif kind == "up":
+            if cursor:
+                cursor -= 1
+            elif page:
+                page, cursor = page - 1, per_page - 1
+        elif kind == "next":
+            if page < pages - 1:
+                page, cursor = page + 1, 0
+            else:
+                note = "This is the last page."
+        elif kind == "prev":
+            if page:
+                page, cursor = page - 1, 0
+            else:
+                note = "This is the first page."
+
+
+def launch_banner(r):
+    """Printed while claude starts, since a big session takes a while to load."""
+    mb = r["size"] / 1048576
+    size = f"{mb:.0f} MB" if mb >= 1 else f"{max(1, r['size'] // 1024)} KB"
+    width = max(20, min(shutil.get_terminal_size().columns, MAX_WIDTH) - 8)
+    wait = " (big session, this can take a few seconds)" if mb >= 50 else ""
+    return "\n".join([
+        "",
+        f"  {BRIGHT}▓▒░ RESUMING SESSION ░▒▓{RESET}",
+        "",
+        f"  {SELECTED}▶ {fit(r['title'], width).rstrip()} {RESET}",
+        f"    {GREEN}{project(r)}{RESET}  {GRAY}{r['cwd']}{RESET}",
+        f"    {GRAY}⣿ loading {size} of history{wait}…{RESET}",
+        "", ""])
+
+
+# The `cs` shell function printed by `claude-sessions init zsh`. It has to be a
+# function, not a command, so the cd happens in your shell and you are still
+# in the project after quitting claude.
+ZSH_INIT = r'''# cs: pick a Claude Code chat, cd into its project, then resume it there.
+unalias cs 2>/dev/null
+function cs {
+  local out dir id
+  out=$(mktemp -t cs) || return
+  CS_OUT=$out command claude-sessions "$@"
+  { IFS= read -r dir; IFS= read -r id } < "$out"
+  [[ -n $id ]] || { rm -f "$out"; return 0 }
+  if [[ -n $dir && -d $dir ]]; then
+    cd "$dir"
+  elif [[ -n $dir ]]; then
+    print -u2 "cs: $dir no longer exists; resuming from $PWD"
+  fi
+  # Warp only learns the folder when a command finishes. Use Warp's own
+  # hooks to end the `cs` block here (in the new folder) and start a new
+  # block for claude, so Warp shows the project folder while claude runs.
+  if (( $+functions[warp_precmd] && $+functions[warp_preexec] )); then
+    warp_precmd
+    warp_preexec "claude --resume $id"
+  fi
+  tail -n +3 "$out"  # the picker's "resuming session" banner, shown while claude loads
+  rm -f "$out"
+  claude --resume "$id"
+}
+'''
+
+
+def main():
+    if sys.argv[1:] == ["--version"]:
+        print(f"claude-sessions {VERSION}")
+        return
+    # Not when run from `cs` (CS_OUT set), where "init zsh" is just a search.
+    if sys.argv[1:] == ["init", "zsh"] and not os.environ.get("CS_OUT"):
+        sys.stdout.write(ZSH_INIT)
+        return
+    args = [a for a in sys.argv[1:] if a not in ("-w", "--web")]
+    # Fewer per page if the window is too short to show the whole panel.
+    per_page = min(PAGE_SIZE, max(5, shutil.get_terminal_size().lines - PANEL_LINES))
+    if "-n" in args:
+        i = args.index("-n")
+        per_page = max(1, int(args[i + 1]))
+        del args[i:i + 2]
+    query = " ".join(args)
+
+    # On a terminal, read single key presses so arrows act immediately.
+    keys = sys.stdin.isatty()
+    saved = termios.tcgetattr(sys.stdin) if keys else None
+    old_winch = signal.signal(signal.SIGWINCH, on_resize) if keys else None
+    rows, r = [], None
+    sys.stdout.write(ALT_ON)
+    try:
+        if keys:
+            tty.setcbreak(sys.stdin)  # keys typed while loading go to the search
+        progress = {"done": 0, "total": 0}
+        with Loading(progress):
+            rows = load_sessions(progress)
+        if rows:
+            r = pick_session(rows, per_page, query,
+                             key_action if keys else line_action,
+                             keys_waiting if keys else (lambda: False))
+    except KeyboardInterrupt:
+        rows = rows or [None]  # quit quietly
+    finally:
+        if saved:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
+            signal.signal(signal.SIGWINCH, old_winch)
+        sys.stdout.write(ALT_OFF)
+        sys.stdout.flush()
+    if not rows:
+        print("No sessions found.")
+    if r is None:
+        return
+    # Called from the `cs` shell function: hand the pick back so the shell
+    # itself cd's into the project (a child process cannot move its parent),
+    # plus the banner to show while claude loads.
+    out = os.environ.get("CS_OUT")
+    if out:
+        with open(out, "w") as f:
+            f.write(f"{r['cwd']}\n{r['id']}\n{launch_banner(r)}")
+        return
+    if r["cwd"] and os.path.isdir(r["cwd"]):
+        os.chdir(r["cwd"])
+    sys.stdout.write(launch_banner(r))
+    sys.stdout.flush()
+    os.execvp("claude", ["claude", "--resume", r["id"]])
+
+
+if __name__ == "__main__":
+    main()
