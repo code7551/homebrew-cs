@@ -26,10 +26,10 @@ Usage:
   cs import F   import a chat saved with Ctrl-E on another Mac, and resume it
   cs -n 20      show 20 per page (default 25, fewer on short windows)
 """
-import ctypes, ctypes.util, glob, io, json, math, os, re, select, shutil, signal
+import ctypes, ctypes.util, errno, glob, io, json, math, os, re, select, shutil, signal
 import struct, subprocess, sys, tarfile, termios, threading, time, tty, unicodedata
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 SKIP_PREFIXES = ("<command-", "<local-command", "Caveat:", "<system-reminder")
 PAGE_SIZE = 25
 PANEL_LINES = 14  # lines the panel uses besides the chat rows
@@ -239,6 +239,52 @@ def read_bundle(path):
         return None
     m["file"] = path
     return m
+
+
+# System Settings pages where macOS lets an app read protected folders.
+FILES_AND_FOLDERS = "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders"
+FULL_DISK_ACCESS = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+
+
+def terminal_app():
+    return {"WarpTerminal": "Warp", "Apple_Terminal": "Terminal", "iTerm.app": "iTerm",
+            "vscode": "VS Code", "ghostty": "Ghostty"}.get(
+                os.environ.get("TERM_PROGRAM", ""), "your terminal app")
+
+
+def privacy_page(path):
+    """Desktop, Documents and Downloads are allowed under Files & Folders;
+    other protected places (iCloud Drive, Trash, Mail…) need Full Disk Access."""
+    home = os.path.expanduser("~")
+    simple = any(path == os.path.join(home, d) or path.startswith(os.path.join(home, d) + "/")
+                 for d in ("Desktop", "Documents", "Downloads"))
+    return FILES_AND_FOLDERS if simple else FULL_DISK_ACCESS
+
+
+def unreadable(path, err):
+    """A row saying why a folder can't be read. When macOS privacy is what
+    blocks it, Enter on the row opens the System Settings page to allow it."""
+    if err.errno == errno.EPERM:
+        return {"kind": "blocked", "cwd": path, "style": WARN, "settings": privacy_page(path),
+                "label": f"⚠ macOS is blocking {terminal_app()} here · Enter to allow it"}
+    reason = {errno.EACCES: "no permission to read this folder",
+              errno.ENOENT: "this folder doesn't exist any more"}.get(
+                  err.errno, f"can't read this folder ({err.strerror})")
+    return {"kind": "none", "cwd": path, "style": WARN, "label": "⚠ " + reason}
+
+
+def downloads_warning():
+    """A row for the top of the list when macOS blocks Downloads, since chat
+    files from another Mac can't be found there then. None when it's readable."""
+    try:
+        os.listdir(DOWNLOADS)
+        return None
+    except OSError as e:
+        if e.errno != errno.EPERM:
+            return None
+    return {"kind": "blocked", "cwd": DOWNLOADS, "style": WARN, "settings": FILES_AND_FOLDERS,
+            "title": f"macOS is blocking {terminal_app()} from Downloads, so chats from your "
+                     "other Mac can't be found · Enter to allow it"}
 
 
 def incoming_bundles():
@@ -454,9 +500,8 @@ def explorer_items(location, query, recent, start):
         with os.scandir(location) as entries:
             names = [e.name for e in entries if e.is_dir()
                      and (not e.name.startswith(".") or query.startswith("."))]
-    except OSError:
-        items.append({"kind": "none", "cwd": location, "style": WARN,
-                      "label": "can't read this folder"})
+    except OSError as e:
+        items.append(unreadable(location, e))
         return items
     known = {p["cwd"]: p for p in recent}
     folders = []
@@ -562,6 +607,8 @@ def row_values(r):
         return {"when": r["title"], "project": "", "title": ""}
     if r.get("kind", "").startswith("act-"):  # a line of a chat's menu
         return {"label": r["label"], "detail": r.get("detail", "")}
+    if r.get("kind") == "blocked" and "title" in r:  # Downloads blocked by macOS
+        return {"when": "⚠ Downloads", "project": "", "title": r["title"]}
     if r.get("kind") == "incoming":  # a chat file from another Mac
         return {"when": "⇣ import", "project": project(r), "title": r["title"]}
     if "label" in r:  # a row of the folder browser
@@ -772,6 +819,9 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
             with Loading(progress, "packing chat for another Mac", unit="MB"):
                 dest = export_session(chat, progress)
         except OSError as e:
+            if e.errno == errno.EPERM:
+                return (f"macOS is blocking {terminal_app()} from Downloads. Allow it in System "
+                        f"Settings › Privacy & Security › Files & Folders, then restart {terminal_app()}.")
             return f"Couldn't save it: {e.strerror or e}"
         if TTY:
             subprocess.run(["open", "-R", dest], check=False)  # show in Finder
@@ -831,9 +881,12 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
                 details = [("new", "pick a folder on the next screen"), ("", "")]
             elif kind_ == "incoming":
                 details = [("file", tilde(sel["bundle"]["file"])), ("from", sel["cwd"])]
+            elif kind_ == "blocked":
+                details = [("dir", sel["cwd"]), ("", "")]
             else:
                 details = [("dir", sel["cwd"]), ("id", sel["id"])] if sel else [("", ""), ("", "")]
-            enter = {"newsession": "⏎ new session", "incoming": "⏎ import"}.get(kind_, "⏎ resume")
+            enter = {"newsession": "⏎ new session", "incoming": "⏎ import",
+                     "blocked": "⏎ open setting"}.get(kind_, "⏎ resume")
             hints = ["↑↓ select", enter] + ([] if kind_ else ["→ menu"])
             hints += ["tab new session"] + (["fn↑↓ page"] if pages > 1 else [])
             hints.append("esc clear" if query else "esc quit")
@@ -848,7 +901,8 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
             drop = ["chats", "when", "added"]
             details = [("dir", sel["cwd"] if sel else ""),
                        ("in", tilde(location) if location else "recent folders")]
-            hints = ["↑↓ select", {"up": "⏎ go up", "mkdir": "⏎ create folder"}.get(
+            hints = ["↑↓ select", {"up": "⏎ go up", "mkdir": "⏎ create folder",
+                                   "blocked": "⏎ open setting", "none": "⏎ —"}.get(
                 kind_, "⏎ import here" if importing else "⏎ start session"), "→ open"]
             if location is not None:
                 hints.append("← back")
@@ -906,7 +960,13 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
             else:
                 note = save(sel)
         elif kind == "enter" and sel:
-            if kind_ == "newsession":
+            if kind_ == "blocked":
+                if TTY:
+                    subprocess.run(["open", sel["settings"]], check=False)
+                page_name = "Files & Folders" if sel["settings"] == FILES_AND_FOLDERS else "Full Disk Access"
+                note = (f"In {page_name}, turn on {terminal_app()}, then quit and reopen "
+                        f"{terminal_app()}.")
+            elif kind_ == "newsession":
                 view = "new"
                 go(None)
             elif kind_ == "incoming":
@@ -1069,7 +1129,18 @@ def main():
         if len(args) != 2:
             print("usage: cs import <file>" + BUNDLE_EXT, file=sys.stderr)
             return
-        importing = read_bundle(os.path.abspath(os.path.expanduser(args[1])))
+        path = os.path.abspath(os.path.expanduser(args[1]))
+        try:
+            open(path, "rb").close()
+        except OSError as e:
+            if e.errno == errno.EPERM:
+                print(f"cs: macOS is blocking {terminal_app()} from {tilde(os.path.dirname(path))}. "
+                      "Allow it in System Settings › Privacy & Security › Files & Folders, "
+                      f"then restart {terminal_app()}.", file=sys.stderr)
+            else:
+                print(f"cs: can't open {args[1]}: {e.strerror}", file=sys.stderr)
+            return
+        importing = read_bundle(path)
         if not importing:
             print(f"cs: {args[1]} isn't a chat saved with Ctrl-E in cs.", file=sys.stderr)
             return
@@ -1094,7 +1165,8 @@ def main():
         picked = pick(rows, projects_of(rows), per_page, query, view,
                       key_action if keys else line_action,
                       keys_waiting if keys else (lambda: False),
-                      incoming=incoming_bundles(), importing=importing)
+                      incoming=[w for w in [downloads_warning()] if w] + incoming_bundles(),
+                      importing=importing)
     except KeyboardInterrupt:
         pass  # quit quietly
     finally:
