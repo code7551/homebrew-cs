@@ -70,6 +70,9 @@ browser opens on your current folder and the folders of your recent chats.
 | type a name, then Enter on `+ create folder` | Make a new folder and open it |
 | Esc | Clear what you typed, or go back to SESSIONS |
 
+Inside a folder, subfolders are listed newest first (by date added, as in
+Finder), so a project you just cloned is at the top.
+
 ```sh
 cs            # all chats, newest first
 cs kiosk      # start with "kiosk" already in the search box
