@@ -52,6 +52,7 @@ Needs zsh and the `claude` CLI. It uses the Python 3 that comes with macOS (`/us
 | type | Search project names and chat titles |
 | ↑ ↓ | Move the selection |
 | Enter | Resume the selected chat in its project folder |
+| Ctrl-S | Save the selected chat to move to another Mac (see below) |
 | ← → | Previous / next page |
 | Backspace, Ctrl-U | Delete a character / clear the search |
 | Esc | Clear the search, or quit if it is empty |
@@ -72,8 +73,23 @@ browser opens on your current folder and the folders of your recent chats.
 cs            # all chats, newest first
 cs kiosk      # start with "kiosk" already in the search box
 cs --new      # go straight to the folder browser for a new session
+cs import F   # import a chat saved with Ctrl-S on another Mac, and resume it
 cs -n 20      # 20 per page (default 25, fewer on short windows)
 ```
+
+## Move a chat to another Mac
+
+1. On this Mac, run `cs`, select the chat and press **Ctrl-S**. It's saved as
+   `~/Downloads/<project>-<id>.claude-session` and shown in Finder.
+2. AirDrop (or copy) that file to the other Mac's Downloads folder.
+3. On the other Mac, run `cs`. The chat is at the top as `⇣ import`; press
+   Enter to import and resume it. (Or run `cs import <file>`.)
+
+The chat goes into the same project folder: the same path, or the same path
+under that Mac's home folder. If neither exists, `cs` asks you to pick the
+folder. Only the conversation moves (with its file checkpoints and
+attachments), so the project's code needs to be on the other Mac too, e.g.
+with `git clone`. Both Macs need `cs` 1.2.0 or newer.
 
 Session titles are cached in `~/.cache/claude-sessions.json`. After the
 first run, it only reads lines added since last time, so the list opens

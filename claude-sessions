@@ -8,6 +8,11 @@ Type to search project names and chat titles. ↑↓ select, Enter resume,
 ← go up, Enter start a new session in the highlighted folder. Type to filter
 folders, or type a name and pick "+ create folder" to make a new one.
 
+Move a chat to another Mac: select it and press Ctrl-S. It is saved as
+~/Downloads/<project>-<id>.claude-session; AirDrop (or copy) that file over.
+On the other Mac it shows up at the top of `cs` (or run `cs import <file>`);
+Enter imports it into that project's folder and resumes it.
+
 Setup (once): add this to ~/.zshrc
   eval "$(claude-sessions init zsh)"
 
@@ -15,18 +20,23 @@ Usage:
   cs            all chats, newest first
   cs bird       start with "bird" already in the search box
   cs --new      open straight on the folder browser for a new session
+  cs import F   import a chat saved with Ctrl-S on another Mac, and resume it
   cs -n 20      show 20 per page (default 25, fewer on short windows)
 """
-import glob, json, math, os, select, shutil, signal, sys, termios
-import threading, time, tty, unicodedata
+import glob, io, json, math, os, re, select, shutil, signal, subprocess, sys
+import tarfile, termios, threading, time, tty, unicodedata
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 SKIP_PREFIXES = ("<command-", "<local-command", "Caveat:", "<system-reminder")
 PAGE_SIZE = 25
 PANEL_LINES = 14  # lines the panel uses besides the chat rows
 MAX_WIDTH = 110  # widest the panel gets on a big terminal
 MAX_TITLE = 300  # characters of a title kept in the cache (and searched)
 CACHE = os.path.expanduser("~/.cache/claude-sessions.json")
+# Claude Code's own folder (it honours CLAUDE_CONFIG_DIR too).
+CLAUDE = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+DOWNLOADS = os.path.expanduser("~/Downloads")
+BUNDLE_EXT = ".claude-session"  # a chat packed for another Mac (a .tar.gz)
 CACHE_VERSION = 1
 TTY = sys.stdout.isatty()
 
@@ -117,7 +127,7 @@ def load_sessions(progress):
         known = cache["files"] if cache.get("version") == CACHE_VERSION else {}
     except (OSError, ValueError, KeyError, AttributeError):
         known = {}
-    paths = glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl"))
+    paths = glob.glob(os.path.join(CLAUDE, "projects", "*", "*.jsonl"))
     progress["total"] = len(paths)
     fresh, rows = {}, []
     for p in paths:
@@ -132,7 +142,7 @@ def load_sessions(progress):
         if title:
             rows.append({"id": os.path.splitext(os.path.basename(p))[0],
                          "title": title, "cwd": entry["cwd"] or "",
-                         "mtime": st.st_mtime, "size": st.st_size})
+                         "mtime": st.st_mtime, "size": st.st_size, "path": p})
     rows.sort(key=lambda r: r["mtime"], reverse=True)
     try:
         os.makedirs(os.path.dirname(CACHE), exist_ok=True)
@@ -142,6 +152,169 @@ def load_sessions(progress):
     except OSError:
         pass  # no cache this time; the next run reads everything again
     return rows
+
+
+class Counting:
+    """File wrapper that adds the bytes read to progress["done"]."""
+
+    def __init__(self, f, progress):
+        self.f, self.progress = f, progress
+
+    def read(self, n=-1):
+        data = self.f.read(n)
+        self.progress["done"] += len(data)
+        return data
+
+
+def project_dir(cwd):
+    """Claude Code keeps a project's chats in a folder named after its path."""
+    return os.path.join(CLAUDE, "projects", re.sub(r"[^a-zA-Z0-9]", "-", cwd))
+
+
+def session_files(r):
+    """(path, name in the bundle, size) of every file belonging to a chat: its
+    log, its subagent/tool-output folder, file checkpoints and uploads."""
+    sid = r["id"]
+    out = [(r["path"], f"session/{sid}.jsonl")]
+    for root, arc in ((os.path.join(os.path.dirname(r["path"]), sid), f"session/{sid}"),
+                      (os.path.join(CLAUDE, "file-history", sid), f"file-history/{sid}"),
+                      (os.path.join(CLAUDE, "uploads", sid), f"uploads/{sid}")):
+        for dirpath, _, names in os.walk(root):
+            for n in sorted(names):
+                path = os.path.join(dirpath, n)
+                if os.path.isfile(path) and not os.path.islink(path):
+                    out.append((path, arc + path[len(root):]))
+    return [(p, a, os.path.getsize(p)) for p, a in out]
+
+
+def export_session(r, progress):
+    """Pack a chat into ~/Downloads/<project>-<id>.claude-session; return its path."""
+    files = session_files(r)
+    progress["total"] = sum(size for _, _, size in files) or 1
+    manifest = {"format": "claude-session", "version": 1, "id": r["id"],
+                "title": r["title"], "cwd": r["cwd"], "home": os.path.expanduser("~"),
+                "size": r["size"], "bytes": progress["total"], "exported": time.time()}
+    name = re.sub(r"[^A-Za-z0-9._-]", "-", project(r)) + f"-{r['id'][:8]}{BUNDLE_EXT}"
+    dest = os.path.join(DOWNLOADS, name)
+    os.makedirs(DOWNLOADS, exist_ok=True)
+    tmp = dest + ".part"
+    try:
+        with tarfile.open(tmp, "w:gz", compresslevel=6) as tar:
+            data = json.dumps(manifest, ensure_ascii=False).encode()
+            info = tarfile.TarInfo("manifest.json")  # first, so it reads fast
+            info.size, info.mtime = len(data), time.time()
+            tar.addfile(info, io.BytesIO(data))
+            for path, arc, size in files:
+                info = tar.gettarinfo(path, arc)
+                info.uid = info.gid = 0
+                info.uname = info.gname = ""
+                with open(path, "rb") as f:
+                    tar.addfile(info, Counting(f, progress))
+        os.replace(tmp, dest)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    return dest
+
+
+def read_bundle(path):
+    """The manifest of a .claude-session file, or None if it isn't one."""
+    try:
+        with tarfile.open(path, "r:gz") as tar:
+            first = tar.next()
+            if first is None or first.name != "manifest.json":
+                return None
+            m = json.load(tar.extractfile(first))
+    except (OSError, EOFError, tarfile.TarError, ValueError):
+        return None
+    if (not isinstance(m, dict) or m.get("format") != "claude-session"
+            or not re.fullmatch(r"[A-Za-z0-9-]+", str(m.get("id", "")))):
+        return None
+    m["file"] = path
+    return m
+
+
+def incoming_bundles():
+    """Chats saved on another Mac and waiting in ~/Downloads, newest first,
+    leaving out ones already imported (unless the file has more of the chat)."""
+    out = []
+    for path in sorted(glob.glob(os.path.join(DOWNLOADS, "*" + BUNDLE_EXT)),
+                       key=os.path.getmtime, reverse=True):
+        m = read_bundle(path)
+        if not m:
+            continue
+        local = glob.glob(os.path.join(CLAUDE, "projects", "*", m["id"] + ".jsonl"))
+        if local and max(os.path.getsize(p) for p in local) >= m.get("size", 0):
+            continue
+        out.append({"kind": "incoming", "bundle": m, "id": m["id"], "title": m.get("title", "?"),
+                    "cwd": m.get("cwd", ""), "mtime": os.path.getmtime(path), "style": WARN})
+    return out
+
+
+def import_target(m):
+    """The chat's project folder on this Mac: the same path, or the same path
+    under this Mac's home folder. None when neither exists (then we ask)."""
+    src, src_home = m.get("cwd") or "", m.get("home") or ""
+    if src and os.path.isdir(src):
+        return src
+    if src_home and (src == src_home or src.startswith(src_home + "/")):
+        mapped = os.path.expanduser("~") + src[len(src_home):]
+        if os.path.isdir(mapped):
+            return mapped
+    return None
+
+
+def moved_line(line, old, new):
+    """A log line with its working folder moved from `old` to `new`."""
+    if not old or b'"cwd"' not in line:
+        return line
+    try:
+        o = json.loads(line)
+    except ValueError:
+        return line
+    c = o.get("cwd") if isinstance(o, dict) else None
+    if not isinstance(c, str) or not (c == old or c.startswith(old + "/")):
+        return line
+    o["cwd"] = new + c[len(old):]
+    return (json.dumps(o, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+
+
+def import_bundle(m, target, progress):
+    """Unpack a .claude-session into Claude Code's folders as a chat of the
+    project at `target`; return it as a row ready to resume."""
+    sid, old = m["id"], m.get("cwd") or ""
+    roots = {"session": project_dir(target),
+             "file-history": os.path.join(CLAUDE, "file-history"),
+             "uploads": os.path.join(CLAUDE, "uploads")}
+    log = os.path.join(roots["session"], sid + ".jsonl")
+    progress["total"] = m.get("bytes") or 1
+    with tarfile.open(m["file"], "r|gz") as tar:
+        for t in tar:
+            top, _, rest = t.name.partition("/")
+            rest = os.path.normpath(rest)
+            # Only files inside this chat's own folders; nothing else gets written.
+            if (not t.isfile() or top not in roots or rest.startswith(("/", ".."))
+                    or not (rest == sid + ".jsonl" or rest.startswith(sid + "/"))
+                    or (top != "session" and rest == sid + ".jsonl")):
+                continue
+            dest = os.path.join(roots[top], rest)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            src = tar.extractfile(t)
+            if dest == log and os.path.exists(log):  # keep what this Mac had
+                os.replace(log, f"{log}.before-import-{int(time.time())}")
+            with open(dest + ".importing", "wb") as f:
+                if dest == log and target != old:
+                    for line in src:
+                        progress["done"] += len(line)
+                        f.write(moved_line(line, old, target))
+                else:
+                    shutil.copyfileobj(Counting(src, progress), f, 1 << 20)
+            os.replace(dest + ".importing", dest)
+    if not os.path.exists(log):
+        raise ValueError("no chat log inside the file")
+    return {"id": sid, "cwd": target, "title": m.get("title", "?"),
+            "size": os.path.getsize(log), "mtime": time.time(), "path": log}
 
 
 def when(ts):
@@ -292,8 +465,8 @@ class Loading:
     """Animated loading screen while sessions are read. It only appears if
     loading takes long enough to notice, so a fast (cached) start has no flash."""
 
-    def __init__(self, progress):
-        self.progress = progress
+    def __init__(self, progress, label="indexing session logs", unit=""):
+        self.progress, self.label, self.unit = progress, label, unit
         self.done = threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True)
 
@@ -314,8 +487,10 @@ class Loading:
         while not self.done.is_set():
             n, total = self.progress["done"], self.progress["total"] or 1
             filled = 30 * n // total
-            bar = f"[{'█' * filled}{'░' * (30 - filled)}]  {n}/{total}"
-            status = f"{SPINNER[frame % len(SPINNER)]} indexing session logs"
+            amount = (f"{n >> 20}/{total >> 20} MB" if self.unit == "MB"
+                      else f"{n}/{total}")
+            bar = f"[{'█' * filled}{'░' * (30 - filled)}]  {amount}"
+            status = f"{SPINNER[frame % len(SPINNER)]} {self.label}"
             draw([(cells(BANNER), f"{BRIGHT}{BANNER}{RESET}"), (0, ""),
                   (cells(bar), f"{GREEN}{status:<{cells(bar)}}{RESET}"),
                   (cells(bar), f"{DARK}{bar}{RESET}")])
@@ -336,6 +511,8 @@ FOLDER_COLUMNS = [("label", "FOLDER", 0, PALE, True, False),
 def row_values(r):
     if r.get("kind") == "newsession":
         return {"when": r["title"], "project": "", "title": ""}
+    if r.get("kind") == "incoming":  # a chat file from another Mac
+        return {"when": "⇣ import", "project": project(r), "title": r["title"]}
     if "label" in r:  # a row of the folder browser
         return {"label": r["label"],
                 "chats": f"{r['count']:>5}" if r.get("count") else "",
@@ -364,7 +541,7 @@ def size_columns(spec, drop, items, inner):
 
 
 def show_page(*, view, items, spec, drop, page, pages, cursor, per_page, query,
-              count, placeholder, empty, details, hints, note):
+              count, placeholder, empty, details, hints, note, tab2="[ NEW SESSION ]"):
     """Draw one page as a panel centered in the terminal."""
     cols, _ = shutil.get_terminal_size()
     inner = max(56, min(MAX_WIDTH, cols - 4))  # columns inside the border
@@ -378,10 +555,10 @@ def show_page(*, view, items, spec, drop, page, pages, cursor, per_page, query,
         return f"{DARK}│{RESET}{body}{' ' * max(0, inner - used)}{DARK}│{RESET}"
 
     # Top border: the two tabs on the left, the page on the right.
-    tab1, tab2 = "[ SESSIONS ]", "[ NEW SESSION ]"
+    tab1 = "[ SESSIONS ]"
     style1, style2 = (SELECTED, GRAY) if view == "sessions" else (GRAY, SELECTED)
     tag = f"[ page {page + 1}/{pages} ]"
-    fill = inner - 3 - cells(tab1) - cells(tab2) - cells(tag)
+    fill = inner - 3 - cells(tab1) - cells(tab2) - cells(tag)  # tab2: second tab's label
     out = [f"{DARK}┌─{RESET}{style1}{tab1}{RESET}{DARK}─{RESET}{style2}{tab2}{RESET}"
            f"{DARK}{'─' * fill}{GREEN}{tag}{DARK}─┐{RESET}", line()]
     pad = (inner - cells(BANNER)) // 2
@@ -420,9 +597,9 @@ def show_page(*, view, items, spec, drop, page, pages, cursor, per_page, query,
     for label, value in details:
         out.append(line((f"  {label:<4} ", GRAY), (fit(value, inner - 9, keep_end=True), GREEN))
                    if label else line())
-    out.append(line(("  ! ", WARN), (fit(note, inner - 5, keep_end=True), WARN))
+    out.append(line(("  ! ", WARN), (fit(note, inner - 5), WARN))
                if note else line())
-    for drop_hint in ("←→ page", "↑↓ select", "tab sessions", "tab new session"):
+    for drop_hint in ("←→ page", "↑↓ select", "^S export", "tab sessions", "tab new session"):
         if cells("─".join(f"[{h}]" for h in hints)) <= inner - 2:
             break  # fewer hints on a narrow terminal
         hints = [h for h in hints if h != drop_hint]
@@ -491,6 +668,8 @@ def key_action():
             return "backspace"
         if k == "\x15":  # Ctrl-U
             return "clear"
+        if k == "\x13":  # Ctrl-S
+            return "export"
         if k in ("\x03", "\x04"):  # Ctrl-C, Ctrl-D
             return "quit"
         if k and k.isprintable():
@@ -503,25 +682,52 @@ def keys_waiting():
 
 def line_action():
     """Whole-line input, for when stdin is not a terminal (e.g. piped): a line
-    names a key (up, down, left, right, tab, esc, bs, or empty for Enter);
+    names a key (up, down, left, right, tab, esc, bs, export, or empty for Enter);
     anything else is typed into the search box."""
     line = input()
     names = {"up": "up", "down": "down", "right": "next", "left": "prev",
-             "tab": "tab", "esc": "esc", "bs": "backspace", "": "enter"}
+             "tab": "tab", "esc": "esc", "bs": "backspace", "export": "export",
+             "": "enter"}
     return names.get(line, ("text", line))
 
 
-def pick(rows, recent, per_page, query, view, next_action, waiting):
+def human(size):
+    return f"{size / 1048576:.0f} MB" if size >= 1048576 else f"{max(1, size >> 10)} KB"
+
+
+def pick(rows, recent, per_page, query, view, next_action, waiting,
+         incoming=(), importing=None):
     """Search and page through chats, or browse folders for a new session
-    (Tab switches). Returns ("resume", chat), ("new", folder row), or None."""
+    (Tab switches). `importing` is a chat file from another Mac whose project
+    folder is being picked. Returns ("resume", chat), ("new", folder row), or None."""
     start = os.getcwd()
     location = None  # folder browser: None is its start page
     page, cursor, note, focus = 0, 0, "", None
+
+    def unpack(m, target):
+        progress = {"done": 0, "total": 0}
+        with Loading(progress, "unpacking chat", unit="MB"):
+            return import_bundle(m, target, progress)
+
+    def choose_folder_for(m):
+        nonlocal importing, view, note
+        importing, view = m, "new"
+        note = f"Where is {project(m)} on this Mac? Pick its folder (it was {tilde(m['cwd'])})."
+
+    if importing:  # `cs import FILE`
+        target = import_target(importing)
+        if target:
+            try:
+                return ("resume", unpack(importing, target))
+            except (OSError, EOFError, tarfile.TarError, ValueError) as e:
+                note, importing = f"Couldn't import it: {e}", None
+        else:
+            choose_folder_for(importing)
     while True:
         words = query.lower().split()
         if view == "sessions":
             found = ([r for r in rows if all(w in haystack(r) for w in words)]
-                     if words else [NEW_ROW] + rows)
+                     if words else list(incoming) + [NEW_ROW] + rows)
             count = f"{len(found)} of {len(rows)} sessions" if words else f"{len(rows)} sessions"
         else:
             found = explorer_items(location, query, recent, start)
@@ -542,10 +748,13 @@ def pick(rows, recent, per_page, query, view, next_action, waiting):
             spec, drop = SESSION_COLUMNS, ["project"]
             if sel is NEW_ROW:
                 details = [("new", "pick a folder on the next screen"), ("", "")]
+            elif kind_ == "incoming":
+                details = [("file", tilde(sel["bundle"]["file"])), ("from", sel["cwd"])]
             else:
                 details = [("dir", sel["cwd"]), ("id", sel["id"])] if sel else [("", ""), ("", "")]
-            hints = ["↑↓ select", "⏎ new session" if sel is NEW_ROW else "⏎ resume",
-                     "tab new session"] + (["←→ page"] if pages > 1 else [])
+            enter = {"newsession": "⏎ new session", "incoming": "⏎ import"}.get(kind_, "⏎ resume")
+            hints = ["↑↓ select", enter] + ([] if kind_ else ["^S export"])
+            hints += ["tab new session"] + (["←→ page"] if pages > 1 else [])
             hints.append("esc clear" if query else "esc quit")
             placeholder = " type to search projects and titles"
         else:
@@ -553,7 +762,7 @@ def pick(rows, recent, per_page, query, view, next_action, waiting):
             details = [("dir", sel["cwd"] if sel else ""),
                        ("in", tilde(location) if location else "recent folders")]
             hints = ["↑↓ select", {"up": "⏎ go up", "mkdir": "⏎ create folder"}.get(
-                kind_, "⏎ start session"), "→ open"]
+                kind_, "⏎ import here" if importing else "⏎ start session"), "→ open"]
             if location is not None:
                 hints.append("← back")
             hints += ["tab sessions", "esc clear" if query else "esc back"]
@@ -564,7 +773,8 @@ def pick(rows, recent, per_page, query, view, next_action, waiting):
                       pages=pages, cursor=cursor, per_page=per_page, query=query,
                       count=count, placeholder=placeholder,
                       empty=f'no sessions match "{query}"', details=details,
-                      hints=hints, note=note)
+                      hints=hints, note=note,
+                      tab2="[ IMPORT TO… ]" if importing else "[ NEW SESSION ]")
             note = ""
         try:
             action = next_action()
@@ -582,16 +792,40 @@ def pick(rows, recent, per_page, query, view, next_action, waiting):
             if query:
                 query, page, cursor = "", 0, 0
             elif view == "new":
-                view, page, cursor = "sessions", 0, 0
+                view, page, cursor, importing = "sessions", 0, 0, None
             else:
                 return None
         elif kind == "tab":
             view = "new" if view == "sessions" else "sessions"
-            query, page, cursor = "", 0, 0
+            query, page, cursor, importing = "", 0, 0, None
+        elif kind == "export":
+            if view != "sessions" or not sel or kind_:
+                note = "Select a chat, then press Ctrl-S to save it for another Mac."
+            else:
+                progress = {"done": 0, "total": 0}
+                try:
+                    with Loading(progress, "packing chat for another Mac", unit="MB"):
+                        dest = export_session(sel, progress)
+                    note = (f"Saved {os.path.basename(dest)} ({human(os.path.getsize(dest))}) "
+                            "to Downloads. AirDrop it to your other Mac.")
+                    if TTY:
+                        subprocess.run(["open", "-R", dest], check=False)  # show in Finder
+                except OSError as e:
+                    note = f"Couldn't save it: {e.strerror or e}"
         elif kind == "enter" and sel:
             if kind_ == "newsession":
                 view = "new"
                 go(None)
+            elif kind_ == "incoming":
+                target = import_target(sel["bundle"])
+                if not target:
+                    choose_folder_for(sel["bundle"])
+                    go(None)
+                else:
+                    try:
+                        return ("resume", unpack(sel["bundle"], target))
+                    except (OSError, EOFError, tarfile.TarError, ValueError) as e:
+                        note = f"Couldn't import it: {e}"
             elif view == "sessions":
                 return ("resume", sel)
             elif kind_ == "up":
@@ -608,6 +842,11 @@ def pick(rows, recent, per_page, query, view, next_action, waiting):
                             note = f"Created {os.path.basename(location.rstrip('/'))}/"
                     except OSError as e:
                         note = f"Couldn't create it: {e.strerror}"
+            elif kind_ in ("here", "dir") and importing:
+                try:
+                    return ("resume", unpack(importing, sel["cwd"]))
+                except (OSError, EOFError, tarfile.TarError, ValueError) as e:
+                    note = f"Couldn't import it: {e}"
             elif kind_ in ("here", "dir"):
                 return ("new", sel)
         elif kind == "next":
@@ -723,6 +962,16 @@ def main():
         i = args.index("-n")
         per_page = max(1, int(args[i + 1]))
         del args[i:i + 2]
+    importing = None
+    if args[:1] == ["import"]:  # cs import FILE: a chat saved on another Mac
+        if len(args) != 2:
+            print("usage: cs import <file>" + BUNDLE_EXT, file=sys.stderr)
+            return
+        importing = read_bundle(os.path.abspath(os.path.expanduser(args[1])))
+        if not importing:
+            print(f"cs: {args[1]} isn't a chat saved with Ctrl-S in cs.", file=sys.stderr)
+            return
+        args = []
     query = " ".join(args)
 
     # On a terminal, read single key presses so arrows act immediately.
@@ -734,23 +983,24 @@ def main():
     try:
         if keys:
             tty.setcbreak(sys.stdin)  # keys typed while loading go to the search
+            attrs = termios.tcgetattr(sys.stdin)
+            attrs[0] &= ~termios.IXON  # let Ctrl-S reach us instead of pausing output
+            termios.tcsetattr(sys.stdin, termios.TCSANOW, attrs)
         progress = {"done": 0, "total": 0}
         with Loading(progress):
             rows = load_sessions(progress)
-        if rows:
-            picked = pick(rows, projects_of(rows), per_page, query, view,
-                          key_action if keys else line_action,
-                          keys_waiting if keys else (lambda: False))
+        picked = pick(rows, projects_of(rows), per_page, query, view,
+                      key_action if keys else line_action,
+                      keys_waiting if keys else (lambda: False),
+                      incoming=incoming_bundles(), importing=importing)
     except KeyboardInterrupt:
-        rows = rows or [None]  # quit quietly
+        pass  # quit quietly
     finally:
         if saved:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
             signal.signal(signal.SIGWINCH, old_winch)
         sys.stdout.write(ALT_OFF)
         sys.stdout.flush()
-    if not rows:
-        print("No sessions found.")
     if picked is None:
         return
     kind, r = picked
