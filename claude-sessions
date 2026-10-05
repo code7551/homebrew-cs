@@ -8,7 +8,7 @@ Type to search project names and chat titles. ↑↓ select, Enter resume,
 ← go up, Enter start a new session in the highlighted folder. Type to filter
 folders, or type a name and pick "+ create folder" to make a new one.
 
-Move a chat to another Mac: select it and press Ctrl-S. It is saved as
+Move a chat to another Mac: select it and press Ctrl-E. It is saved as
 ~/Downloads/<project>-<id>.claude-session; AirDrop (or copy) that file over.
 On the other Mac it shows up at the top of `cs` (or run `cs import <file>`);
 Enter imports it into that project's folder and resumes it.
@@ -20,7 +20,7 @@ Usage:
   cs            all chats, newest first
   cs bird       start with "bird" already in the search box
   cs --new      open straight on the folder browser for a new session
-  cs import F   import a chat saved with Ctrl-S on another Mac, and resume it
+  cs import F   import a chat saved with Ctrl-E on another Mac, and resume it
   cs -n 20      show 20 per page (default 25, fewer on short windows)
 """
 import glob, io, json, math, os, re, select, shutil, signal, subprocess, sys
@@ -599,7 +599,7 @@ def show_page(*, view, items, spec, drop, page, pages, cursor, per_page, query,
                    if label else line())
     out.append(line(("  ! ", WARN), (fit(note, inner - 5), WARN))
                if note else line())
-    for drop_hint in ("←→ page", "↑↓ select", "^S export", "tab sessions", "tab new session"):
+    for drop_hint in ("←→ page", "↑↓ select", "^E export", "tab sessions", "tab new session"):
         if cells("─".join(f"[{h}]" for h in hints)) <= inner - 2:
             break  # fewer hints on a narrow terminal
         hints = [h for h in hints if h != drop_hint]
@@ -668,7 +668,7 @@ def key_action():
             return "backspace"
         if k == "\x15":  # Ctrl-U
             return "clear"
-        if k == "\x13":  # Ctrl-S
+        if k in ("\x05", "\x13"):  # Ctrl-E; Ctrl-S too where the terminal allows
             return "export"
         if k in ("\x03", "\x04"):  # Ctrl-C, Ctrl-D
             return "quit"
@@ -753,7 +753,7 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
             else:
                 details = [("dir", sel["cwd"]), ("id", sel["id"])] if sel else [("", ""), ("", "")]
             enter = {"newsession": "⏎ new session", "incoming": "⏎ import"}.get(kind_, "⏎ resume")
-            hints = ["↑↓ select", enter] + ([] if kind_ else ["^S export"])
+            hints = ["↑↓ select", enter] + ([] if kind_ else ["^E export"])
             hints += ["tab new session"] + (["←→ page"] if pages > 1 else [])
             hints.append("esc clear" if query else "esc quit")
             placeholder = " type to search projects and titles"
@@ -800,7 +800,7 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
             query, page, cursor, importing = "", 0, 0, None
         elif kind == "export":
             if view != "sessions" or not sel or kind_:
-                note = "Select a chat, then press Ctrl-S to save it for another Mac."
+                note = "Select a chat, then press Ctrl-E to save it for another Mac."
             else:
                 progress = {"done": 0, "total": 0}
                 try:
@@ -969,7 +969,7 @@ def main():
             return
         importing = read_bundle(os.path.abspath(os.path.expanduser(args[1])))
         if not importing:
-            print(f"cs: {args[1]} isn't a chat saved with Ctrl-S in cs.", file=sys.stderr)
+            print(f"cs: {args[1]} isn't a chat saved with Ctrl-E in cs.", file=sys.stderr)
             return
         args = []
     query = " ".join(args)
@@ -984,7 +984,7 @@ def main():
         if keys:
             tty.setcbreak(sys.stdin)  # keys typed while loading go to the search
             attrs = termios.tcgetattr(sys.stdin)
-            attrs[0] &= ~termios.IXON  # let Ctrl-S reach us instead of pausing output
+            attrs[0] &= ~termios.IXON  # let Ctrl-S reach us (where the terminal allows)
             termios.tcsetattr(sys.stdin, termios.TCSANOW, attrs)
         progress = {"done": 0, "total": 0}
         with Loading(progress):
