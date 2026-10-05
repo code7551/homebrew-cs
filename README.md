@@ -21,15 +21,25 @@ Or browse to any folder and start a new chat there.
 
 ## Install
 
-```sh
-brew install code7551/cs/cs
-```
+1. Install with Homebrew:
 
-Then add this line to `~/.zshrc` and open a new terminal:
+   ```sh
+   brew install code7551/cs/cs
+   ```
 
-```sh
-(( $+commands[claude-sessions] )) && eval "$(claude-sessions init zsh)"
-```
+2. Add `cs` to your `~/.zshrc` (run this once):
+
+   ```sh
+   printf '\n%s\n' '(( $+commands[claude-sessions] )) && eval "$(claude-sessions init zsh)"' >> ~/.zshrc
+   ```
+
+3. Load it now, or just open a new terminal tab:
+
+   ```sh
+   source ~/.zshrc
+   ```
+
+Then run `cs`.
 
 Needs zsh and the `claude` CLI. It uses the Python 3 that comes with macOS (`/usr/bin/python3`).
 

@@ -9,11 +9,11 @@ class Cs < Formula
   end
 
   def caveats
-    <<~EOS
-      Add this line to ~/.zshrc, then open a new terminal:
-        (( $+commands[claude-sessions] )) && eval "$(claude-sessions init zsh)"
+    <<~'EOS'
+      Add cs to your ~/.zshrc (run this once):
+        printf '\n%s\n' '(( $+commands[claude-sessions] )) && eval "$(claude-sessions init zsh)"' >> ~/.zshrc
 
-      Then run `cs` to search your Claude Code chats and resume one.
+      Then run `source ~/.zshrc` (or open a new terminal tab) and run `cs`.
     EOS
   end
 
