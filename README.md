@@ -52,7 +52,7 @@ Needs zsh and the `claude` CLI. It uses the Python 3 that comes with macOS (`/us
 | type | Search project names and chat titles |
 | ↑ ↓ | Move the selection |
 | Enter | Resume the selected chat in its project folder |
-| → | Menu for the selected chat: resume it, or save it for another Mac |
+| → | Menu for the selected chat: resume it, save it for another Mac, or delete it (to the Trash, after you confirm) |
 | Ctrl-E | Save the selected chat for another Mac (shortcut, see below) |
 | ← / fn+↑ fn+↓ | Previous page / page up and down |
 | Backspace, Ctrl-U | Delete a character / clear the search |

@@ -2,7 +2,8 @@
 """Pick a Claude Code chat session and resume it.
 
 Type to search project names and chat titles. ↑↓ select, Enter resume,
-→ menu for the selected chat (resume, or save it for another Mac), ← and
+→ menu for the selected chat (resume, save it for another Mac, or delete
+it: it goes to the Trash after you confirm), ← and
 fn+↑↓ change page, Esc clears the search (or quits when it is empty).
 
 "+ New session" (or Tab) opens a folder browser: ↑↓ select, → open a folder,
@@ -29,7 +30,7 @@ Usage:
 import ctypes, ctypes.util, errno, glob, io, json, math, os, re, select, shutil, signal
 import struct, subprocess, sys, tarfile, termios, threading, time, tty, unicodedata
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 SKIP_PREFIXES = ("<command-", "<local-command", "Caveat:", "<system-reminder")
 PAGE_SIZE = 25
 PANEL_LINES = 14  # lines the panel uses besides the chat rows
@@ -188,6 +189,49 @@ def session_files(r):
                 if os.path.isfile(path) and not os.path.islink(path):
                     out.append((path, arc + path[len(root):]))
     return [(p, a, os.path.getsize(p)) for p, a in out]
+
+
+def running_sessions():
+    """Ids of the chats Claude Code has open right now (in any window)."""
+    ids = set()
+    for f in glob.glob(os.path.join(CLAUDE, "sessions", "*.json")):
+        try:
+            with open(f) as fh:
+                d = json.load(fh)
+            pid = int(d.get("pid") or os.path.basename(f).split(".")[0])
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        try:
+            os.kill(pid, 0)  # is that Claude Code still running?
+        except PermissionError:
+            pass  # it is, under another user
+        except OSError:
+            continue
+        ids.add(d.get("sessionId"))
+    return ids
+
+
+def chat_paths(r):
+    """The files and folders that make up a chat, for deleting it."""
+    sid = r["id"]
+    paths = [r["path"], os.path.join(os.path.dirname(r["path"]), sid)]
+    paths += [os.path.join(CLAUDE, d, sid) for d in ("file-history", "uploads", "session-env")]
+    return [p for p in paths if os.path.lexists(p)]
+
+
+def move_to_trash(paths):
+    """Move to the macOS Trash, where Finder's Put Back can restore them."""
+    if os.path.exists("/usr/bin/trash"):
+        r = subprocess.run(["/usr/bin/trash", *paths], capture_output=True, text=True)
+        if r.returncode:
+            raise OSError(r.stderr.strip() or "the trash command failed")
+        return
+    trash, stamp = os.path.expanduser("~/.Trash"), time.strftime("%H-%M-%S")
+    for p in paths:  # older macOS: move them in ourselves
+        dest = os.path.join(trash, os.path.basename(p))
+        if os.path.lexists(dest):
+            dest += f" {stamp}"
+        os.rename(p, dest)
 
 
 def bundle_name(r):
@@ -811,6 +855,7 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
     location = None  # folder browser: None is its start page
     page, cursor, note, focus = 0, 0, "", None
     menu, back_to = None, (0, 0)  # the chat whose menu is open, list position
+    open_now = False  # is that chat open in a Claude Code window right now
 
     def save(chat):
         """Export a chat for another Mac; returns the note to show."""
@@ -827,6 +872,15 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
             subprocess.run(["open", "-R", dest], check=False)  # show in Finder
         return (f"Saved {os.path.basename(dest)} ({human(os.path.getsize(dest))}) "
                 "to Downloads. AirDrop it to your other Mac.")
+
+    def delete(chat):
+        """Move a chat to the Trash; returns the note to show."""
+        try:
+            move_to_trash(chat_paths(chat))
+        except OSError as e:
+            return f"Couldn't delete it: {e.strerror or e}"
+        rows.remove(chat)
+        return f'Moved "{fit(chat["title"], 40).rstrip()}" to the Trash (Finder\'s Put Back restores it).'
 
     def unpack(m, target):
         progress = {"done": 0, "total": 0}
@@ -858,7 +912,17 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
                       "detail": "(Enter on the list does this too)"},
                      {"kind": "act-export", "label": "⇪ Save for another Mac",
                       "detail": f"→ ~/Downloads/{bundle_name(menu)}   (shortcut: Ctrl-E)"},
+                     {"kind": "act-delete", "label": "✕ Delete chat",
+                      "style": GRAY if open_now else WARN,
+                      "detail": "(open in another window: close it there first)" if open_now
+                      else "moves it to the Trash, after you confirm"},
                      {"kind": "act-back", "label": "← Back", "style": GRAY}]
+            count = ""
+        elif view == "confirm":
+            found = [{"kind": "act-cancel", "label": "← Cancel", "style": GRAY,
+                      "detail": "keep the chat"},
+                     {"kind": "act-delete-yes", "label": "✕ Move to Trash", "style": WARN,
+                      "detail": "its log, tool outputs, checkpoints and uploads"}]
             count = ""
         else:
             found = explorer_items(location, query, recent, start)
@@ -891,7 +955,7 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
             hints += ["tab new session"] + (["fn↑↓ page"] if pages > 1 else [])
             hints.append("esc clear" if query else "esc quit")
             placeholder = " type to search projects and titles"
-        elif view == "menu":
+        elif view in ("menu", "confirm"):
             spec, drop = ACTION_COLUMNS, []
             details = [("dir", menu["cwd"]), ("id", menu["id"])]
             hints = ["↑↓ select", "⏎ choose", "← back", "esc back"]
@@ -916,7 +980,8 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
                       empty=f'no sessions match "{query}"', details=details,
                       hints=hints, note=note,
                       tab2="[ IMPORT TO… ]" if importing else "[ NEW SESSION ]",
-                      heading=f"{project(menu)} · {menu['title']}" if view == "menu" else None)
+                      heading=(f"Delete {project(menu)} · {menu['title']}?" if view == "confirm"
+                               else f"{project(menu)} · {menu['title']}" if view == "menu" else None))
             note = ""
         try:
             action = next_action()
@@ -939,6 +1004,23 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
             elif kind == "export" or (pressed and kind_ == "act-export"):
                 note = save(menu)
                 view, menu, (page, cursor) = "sessions", None, back_to
+            elif pressed and kind_ == "act-delete":
+                if open_now:
+                    note = "This chat is open in another window. Close it there, then delete it."
+                else:
+                    view, page, cursor = "confirm", 0, 0  # Cancel is highlighted first
+            elif kind == "down" and cursor < len(page_rows) - 1:
+                cursor += 1
+            elif kind == "up" and cursor:
+                cursor -= 1
+            continue
+        if view == "confirm":  # "Delete this chat?": Cancel or Move to Trash
+            pressed = kind in ("enter", "next")
+            if pressed and kind_ == "act-delete-yes":
+                note = delete(menu)
+                view, menu, (page, cursor) = "sessions", None, back_to
+            elif kind in ("esc", "prev") or (pressed and kind_ == "act-cancel"):
+                view, page, cursor = "menu", 0, 2  # back on "Delete chat"
             elif kind == "down" and cursor < len(page_rows) - 1:
                 cursor += 1
             elif kind == "up" and cursor:
@@ -1010,6 +1092,7 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
             elif sel and not kind_:  # a chat: open its menu
                 back_to, menu, view = (page, cursor), sel, "menu"
                 page, cursor = 0, 0
+                open_now = sel["id"] in running_sessions()
             elif page < pages - 1:
                 page, cursor = page + 1, 0
             else:
