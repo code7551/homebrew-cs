@@ -1,1 +1,4 @@
 __pycache__/
+promo/out/
+promo/node_modules/
+promo/frames.json

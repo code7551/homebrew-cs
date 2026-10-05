@@ -4,6 +4,8 @@ A searchable terminal picker for your [Claude Code](https://claude.com/claude-co
 Run `cs`, find a chat, press Enter, and it opens in that chat's project folder.
 Or browse to any folder and start a new chat there.
 
+https://github.com/user-attachments/assets/c43ca31f-d0f9-4987-900e-445597643197
+
 ```
 ┌─[ SESSIONS ]─[ NEW SESSION ]──────────────────────────────────[ page 1/1 ]─┐
 │                  ▓▒░  C L A U D E   S E S S I O N S  ░▒▓                   │

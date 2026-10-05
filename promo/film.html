@@ -1,0 +1,587 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>cs launch film</title>
+<style>html, body { margin: 0; background: #000; } canvas { display: block; }</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+// "Lock-on": a 30 s film for cs, built from the real cs screens (frames.json, made by capture.py).
+// Every frame is a pure function of time; picture and score share one 120 BPM timeline.
+const W = 1920, H = 1080, FPS = 60, DURATION = 30;
+const MONO = 'ui-monospace, "SF Mono", Menlo, monospace';
+const FS = 22, LH = 28, S = 1.6;          // terminal font size, line height, render scale for crisp zooms
+const PAL = { 16: '#000000', 22: '#005f00', 28: '#008700', 34: '#00af00', 46: '#00ff00',
+              151: '#afd7af', 214: '#ffaf00', 245: '#8a8a8a' };
+const FG = '#c9d6c9', NEON = '#00ff00', PALE = '#cfe8cf', ORANGE = '#ffaf00', GRAY = '#6f7d72', BG = '#020603';
+
+// ---- the timeline (seconds; one beat = 0.5 s) --------------------------------------------
+const K = {
+  cs: [3.75, 3.875], csEnter: 4.25, lock1: 6.0,
+  search: [6.75, 7.0, 7.25, 7.5, 7.75], down1: 8.5, enter1: 10.5,
+  tab: 14.5, open: 15.0, downs: [15.75, 16.0, 16.25], enter2: 17.25,
+  menu: 18.75, saveDown: 19.25, saveEnter: 19.75, whipA: 20.5, whipB: 21.25, enter3: 22.75,
+  end: 24.5, bigCs: [24.75, 25.0], lock2: 25.5,
+};
+const CAPTIONS = [  // [text, start, chars per second, x, y, size, colour]
+  ['14 chats.', 0.25, 24, 220, 430, 66, PALE],
+  ['10 projects.', 1.0, 24, 220, 520, 66, PALE],
+  ['Which folder was that one in?', 1.75, 28, 220, 650, 72, '#ffffff'],
+  ['Type to find any chat, in any project.', 7.0, 34, 'center', 1010, 44, PALE],
+  ['Enter. The right chat, in the right folder.', 12.0, 34, 'center', 930, 46, PALE],
+  ['New chat? Pick a folder. Newest first.', 15.25, 34, 'center', 1010, 44, PALE],
+  ['Move a chat to your other Mac.', 21.5, 30, 'center', 1010, 44, PALE],
+  ['brew install code7551/cs/cs', 25.75, 26, 'center', 700, 52, NEON],
+  ['Find any Claude chat. Land in the right folder.', 26.8, 40, 'center', 800, 38, PALE],
+  ['github.com/code7551/homebrew-cs', 28.0, 55, 'center', 870, 24, GRAY],
+];
+const NOISE_LINES = [
+  'kiosk-ui       make the kiosk checkout work offline', 'orbit-api      rate limiter returns 500 under load',
+  'lumen-app      dark mode for the settings screen', 'ledger         monthly totals are off by one cent',
+  'atlas-docs     rewrite the getting-started guide', 'pixel-forge    speed up the sprite exporter',
+  'tidepool       move the cron jobs onto a queue', 'nightjar       push notifications on Android 16',
+  'harbor-infra   terraform plan shows drift on the VPC', 'sundial        timezone bug in the booking calendar',
+  'kiosk-ui       kiosk receipt printer keeps timing out', 'orbit-api      add pagination to /v2/orders',
+  'lumen-app      fix the flicker when the list refreshes', 'kiosk-ui       add QR payments to the kiosk',
+  '~/GitHub/orbit-api', '~/GitHub/kiosk-ui', '~/work/old/lumen-app', '~/GitHub/tidepool', '~/Desktop/ledger-copy',
+  'claude --resume', 'which folder?', 'cd ..', 'ls ~/GitHub', 'was it last week?',
+];
+
+// ---- helpers -----------------------------------------------------------------------------
+const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, p) => a + (b - a) * p;
+const ease = p => (p = clamp(p), p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2);
+const easeOut = p => 1 - Math.pow(1 - clamp(p), 3);
+const span = (t, a, b) => clamp((t - a) / (b - a));
+function hash(n) {
+  n = Math.imul(n ^ 0x9e3779b9, 0x85ebca6b); n ^= n >>> 13; n = Math.imul(n, 0xc2b2ae35); n ^= n >>> 16;
+  return (n >>> 0) / 4294967296;
+}
+const typedCount = (len, t, t0, cps) => clamp(Math.floor((t - t0) * cps + 1e-6), 0, len);
+const charTimes = (str, t0, cps) => [...str].map((ch, i) => [t0 + i / cps, ch]).filter(([, ch]) => ch !== ' ');
+
+let DATA, CW;
+const canvas = document.getElementById('c'), out = canvas.getContext('2d');
+const mk = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
+const scene = mk(W, H), sc = scene.getContext('2d');
+const acc = mk(W, H), ac = acc.getContext('2d');
+let gridBg, vignette, scanlines;
+
+// ---- the cs screens, drawn as a character grid ------------------------------------------
+const BOX = { '─': 'lr', '│': 'ud', '┌': 'rd', '┐': 'ld', '└': 'ur', '┘': 'lu', '├': 'udr', '┤': 'udl' };
+const SHADE = { '█': 1, '▓': 0.78, '▒': 0.52, '░': 0.26 };
+const cache = new Map();
+function screenCanvas(key, grid) {
+  if (cache.has(key)) { const v = cache.get(key); cache.delete(key); cache.set(key, v); return v; }
+  const cv = mk(Math.ceil(DATA.cols * CW * S), Math.ceil(grid.length * LH * S));
+  const g = cv.getContext('2d');
+  g.scale(S, S); g.textBaseline = 'middle';
+  grid.forEach((runs, y) => {
+    for (const [x0, text, fg, bg, bold, ul] of runs) {
+      g.font = `${bold ? 700 : 400} ${FS}px ${MONO}`;
+      const col = fg != null ? PAL[fg] : FG;
+      [...text].forEach((ch, i) => {
+        const x = (x0 + i) * CW, top = y * LH;
+        if (bg != null) { g.fillStyle = PAL[bg]; g.fillRect(x, top, CW + 0.6, LH); }
+        g.fillStyle = col;
+        if (BOX[ch]) {
+          const s = BOX[ch], cx = x + CW / 2, cy = top + LH / 2, w = 1.6;
+          if (s.includes('l')) g.fillRect(x, cy - w / 2, CW / 2 + w / 2, w);
+          if (s.includes('r')) g.fillRect(cx - w / 2, cy - w / 2, CW / 2 + w / 2 + 0.6, w);
+          if (s.includes('u')) g.fillRect(cx - w / 2, top, w, LH / 2 + w / 2);
+          if (s.includes('d')) g.fillRect(cx - w / 2, cy - w / 2, w, LH / 2 + w / 2 + 0.6);
+        } else if (SHADE[ch] != null) {
+          g.globalAlpha = SHADE[ch]; g.fillRect(x, top + 4, CW, LH - 8); g.globalAlpha = 1;
+        } else if (ch !== ' ') {
+          g.fillText(ch, x, top + LH / 2 + 1);
+        }
+        if (ul && ch !== ' ') g.fillRect(x, top + LH - 5, CW, 1.6);
+      });
+    }
+  });
+  cache.set(key, cv);
+  if (cache.size > 10) cache.delete(cache.keys().next().value);
+  return cv;
+}
+const PANEL_W = () => DATA.cols * CW, PANEL_H = () => DATA.rows * LH;
+const panelX = () => (W - PANEL_W()) / 2, panelY = () => (H - PANEL_H()) / 2;
+// The box of the panel itself (the screen has one blank column either side).
+const boxOf = (x, y) => ({ x: x + CW, y, w: (DATA.cols - 2) * CW, h: PANEL_H() });
+
+function withCam(c, cam, fn) {
+  c.save();
+  if (cam) { c.translate(W / 2, H / 2); c.scale(cam.z, cam.z); c.translate(-cam.x, -cam.y); }
+  fn(); c.restore();
+}
+function drawScreen(c, key, grid, x, y, clip) {
+  const cv = screenCanvas(key, grid);
+  c.save();
+  if (clip) { c.beginPath(); clip(x, y); c.clip(); }
+  c.drawImage(cv, x, y, DATA.cols * CW, grid.length * LH);
+  c.restore();
+}
+// Camera that leans toward a point of the panel: z = zoom, (fx, fy) = 0..1 across the panel box.
+function lean(z, fx, fy) {
+  const b = boxOf(panelX(), panelY());
+  return { z, x: lerp(W / 2, b.x + b.w * fx, 1 - 1 / z), y: lerp(H / 2, b.y + b.h * fy, 1 - 1 / z) };
+}
+
+// ---- text ----------------------------------------------------------------------------------
+function typed(c, str, t, t0, cps, x, y, size, color, o = {}) {
+  if (t < t0) return;
+  const n = typedCount(str.length, t, t0, cps);
+  c.font = `${o.weight ?? 600} ${size}px ${MONO}`;
+  c.textBaseline = 'alphabetic';
+  const full = c.measureText(str).width;
+  const left = x === 'center' ? (W - full) / 2 : x;
+  c.fillStyle = color;
+  c.fillText(str.slice(0, n), left, y);
+  const done = t0 + str.length / cps;
+  if (t < done + (o.caretHold ?? 0.5) && (t < done || Math.floor(t * 4) % 2 === 0)) {
+    const w = c.measureText(str.slice(0, n)).width;
+    c.fillStyle = NEON;
+    c.fillRect(left + w + size * 0.08, y - size * 0.78, size * 0.52, size * 0.92);
+  }
+}
+function captionBand(c, y, a) {  // a dark band so captions read over the panel
+  if (a <= 0) return;
+  const g = c.createLinearGradient(0, y - 120, 0, H);
+  g.addColorStop(0, 'rgba(2,6,3,0)'); g.addColorStop(0.35, `rgba(2,6,3,${0.88 * a})`); g.addColorStop(1, `rgba(2,6,3,${0.95 * a})`);
+  c.fillStyle = g; c.fillRect(0, y - 120, W, H - y + 120);
+}
+function label(c, text, x, y, color, a = 1) {
+  if (a <= 0) return;
+  const spaced = [...text].join(' ');
+  c.globalAlpha = a; c.font = `700 22px ${MONO}`; c.textBaseline = 'alphabetic';
+  if (x === 'right') x = W - 44 - c.measureText(spaced).width;
+  c.fillStyle = BG; c.fillRect(x - 12, y - 26, c.measureText(spaced).width + 24, 36);  // reads over the panel
+  c.fillStyle = color; c.fillText(spaced, x, y); c.globalAlpha = 1;
+}
+
+// A line wipe: grid rows switch off top to bottom, with a bright edge at the front.
+function wipe(c, p) {
+  if (p <= 0) return;
+  const n = Math.ceil(H / LH), front = p * (n + 4);
+  for (let i = 0; i < n; i++) {
+    const a = clamp(front - i, 0, 1);
+    if (a <= 0) break;
+    c.fillStyle = BG; c.globalAlpha = a; c.fillRect(0, i * LH, W, LH);
+    if (a < 1) { c.globalAlpha = 1; c.fillStyle = NEON; c.fillRect(0, i * LH + LH - 2, W, 2); }
+  }
+  c.globalAlpha = 1;
+}
+// Lock-on brackets around a box: they snap in from slightly larger.
+function brackets(c, b, t, t0, color = NEON, fadeAfter = null) {
+  if (t < t0) return;
+  const p = easeOut(span(t, t0, t0 + 0.18)), grow = lerp(26, 0, p), pad = 14 + grow, arm = 54, th = 4;
+  c.globalAlpha = clamp(span(t, t0, t0 + 0.06)) * (1 - 0.35 * span(t, t0 + 0.4, t0 + 1.2))
+    * (fadeAfter == null ? 1 : 1 - span(t, t0 + fadeAfter, t0 + fadeAfter + 0.2));
+  if (c.globalAlpha <= 0) { c.globalAlpha = 1; return; }
+  c.fillStyle = color;
+  const x0 = b.x - pad, y0 = b.y - pad, x1 = b.x + b.w + pad, y1 = b.y + b.h + pad;
+  for (const [x, y, dx, dy] of [[x0, y0, 1, 1], [x1, y0, -1, 1], [x0, y1, 1, -1], [x1, y1, -1, -1]]) {
+    c.fillRect(dx > 0 ? x : x - arm, dy > 0 ? y : y - th, arm, th);
+    c.fillRect(dx > 0 ? x : x - th, dy > 0 ? y : y - arm, th, arm);
+  }
+  c.globalAlpha = 1;
+}
+
+// ---- scenes --------------------------------------------------------------------------------
+function noiseWall(c, t) {
+  const a = easeOut(span(t, 0, 0.5)) * (1 - span(t, 3.25, 3.5));
+  if (a <= 0) return;
+  c.font = `400 19px ${MONO}`; c.textBaseline = 'alphabetic';
+  const cols = [[70, 38], [720, 52], [1360, 30]];
+  cols.forEach(([x, speed], ci) => {
+    const off = speed * t + 26 * t * t;  // speeds up: the anxious scroll
+    const first = Math.floor(off / 30) - 1;
+    for (let k = first; k < first + 40; k++) {
+      const y = k * 30 - off + 40;
+      if (y < -10 || y > H + 30) continue;
+      const idx = ((k * 7 + ci * 13) % NOISE_LINES.length + NOISE_LINES.length) % NOISE_LINES.length;
+      const flick = hash(k * 31 + ci * 977 + Math.floor(t * 10)) > 0.965;
+      c.fillStyle = flick ? '#4fdc6a' : (hash(k + ci * 101) > 0.5 ? '#16431f' : '#1f5a2c');
+      c.globalAlpha = a * (flick ? 0.9 : 0.75);
+      c.fillText(NOISE_LINES[idx], x, y);
+    }
+  });
+  c.globalAlpha = 1;
+  // keep the captions readable: a dark wash on the left
+  const g = c.createLinearGradient(0, 0, 1200, 0);
+  g.addColorStop(0, `rgba(2,6,3,${0.92 * a})`); g.addColorStop(0.7, `rgba(2,6,3,${0.75 * a})`); g.addColorStop(1, 'rgba(2,6,3,0)');
+  c.fillStyle = g; c.fillRect(0, 300, 1300, 420);
+}
+
+function prompt(c, t, x, y, size, cmd, keys, enter) {
+  c.font = `600 ${size}px ${MONO}`; c.textBaseline = 'alphabetic';
+  c.fillStyle = PALE; c.fillText('~', x, y);
+  const wT = c.measureText('~ ').width;
+  c.fillStyle = NEON; c.fillText('❯', x + wT, y);
+  const wP = c.measureText('~ ❯ ').width;
+  const n = keys.filter(k => t >= k).length;
+  c.fillStyle = '#ffffff'; c.fillText(cmd.slice(0, n), x + wP, y);
+  const w = c.measureText(cmd.slice(0, n)).width;
+  if (!enter || t < enter) {
+    if (Math.floor(t * 4) % 2 === 0 || n < cmd.length) { c.fillStyle = NEON; c.fillRect(x + wP + w + 4, y - size * 0.8, size * 0.55, size * 0.95); }
+  }
+}
+
+function summon(c, t) {  // 3.5 - 6.5: `cs` Enter, the panel draws itself, locks on
+  if (t < K.csEnter) {
+    prompt(c, t, W / 2 - 110, H / 2 + 14, 48, 'cs', K.cs, K.csEnter);
+    return;
+  }
+  const g = DATA.scenes.search[0], x = panelX(), y = panelY(), b = boxOf(x, y);
+  const pB = ease(span(t, K.csEnter + 0.05, K.csEnter + 0.55)), pR = ease(span(t, K.csEnter + 0.4, K.csEnter + 1.35));
+  drawScreen(c, 'search0', g, x, y, () => {
+    const per = 2 * (b.w + b.h), d = pB * per, e = LH;
+    c.rect(b.x, b.y, clamp(d, 0, b.w), e);                                         // top, left to right
+    if (d > b.w) c.rect(b.x + b.w - CW, b.y, CW, clamp(d - b.w, 0, b.h));             // right, downwards
+    if (d > b.w + b.h) { const l = clamp(d - b.w - b.h, 0, b.w); c.rect(b.x + b.w - l, b.y + b.h - e, l, e); }
+    if (d > 2 * b.w + b.h) { const l = clamp(d - 2 * b.w - b.h, 0, b.h); c.rect(b.x, b.y + b.h - l, CW, l); }
+    c.rect(b.x, b.y, b.w, b.h * pR);                                                 // rows cascade in
+  });
+  if (pR > 0 && pR < 1) { c.fillStyle = NEON; c.globalAlpha = 0.8; c.fillRect(b.x, b.y + b.h * pR - 2, b.w, 2); c.globalAlpha = 1; }
+  brackets(c, b, t, K.lock1, NEON, 0.25);  // gone before the search starts
+}
+
+function searchScene(c, t) {  // 6.5 - 10.5
+  const shots = DATA.scenes.search;
+  let i = 0;
+  K.search.forEach((k, j) => { if (t >= k) i = j + 1; });
+  if (t >= K.down1) i = 6;
+  const z = lerp(1, 1.24, ease(span(t, 6.5, 7.4))) - 0.24 * ease(span(t, 9.9, 10.5));
+  withCam(c, lean(z, 0.35, 0.18), () => drawScreen(c, 'search' + i, shots[i], panelX(), panelY()));
+  captionBand(c, 1010, span(t, 6.8, 7.1) * (1 - span(t, 10.2, 10.5)));
+}
+
+function bannerReveal(c, key, grid, t, t0, x, y, scale, cps = 90) {
+  const rows = grid.map((runs, r) => [r, runs.length ? Math.max(...runs.map(([x0, s]) => x0 + s.length)) : 0]).filter(([, w]) => w);
+  const cv = screenCanvas(key, grid);
+  c.save(); c.translate(x, y); c.scale(scale, scale);
+  rows.forEach(([r, width], k) => {
+    const n = clamp((t - t0 - k * 0.12) * cps, 0, width);
+    if (n <= 0) return;
+    c.save(); c.beginPath(); c.rect(0, r * LH, n * CW, LH); c.clip();
+    c.drawImage(cv, 0, 0, DATA.cols * CW, grid.length * LH);
+    c.restore();
+  });
+  c.restore();
+}
+
+function scramble(c, from, to, t, t0, x, y, size, color) {
+  c.font = `700 ${size}px ${MONO}`; c.textBaseline = 'alphabetic';
+  const len = Math.max(from.length, to.length), cw = c.measureText('M').width;
+  for (let i = 0; i < len; i++) {
+    const settle = t0 + 0.08 + i * 0.03;
+    let ch;
+    if (t < t0) ch = from[i] ?? '';
+    else if (t >= settle) ch = to[i] ?? '';
+    else ch = '▓▒░/~<>{}#$%&*'.charAt(Math.floor(hash(i * 97 + Math.floor(t * 30)) * 14));
+    c.fillStyle = t >= settle ? color : '#4fdc6a';
+    c.fillText(ch, x + i * cw, y);
+  }
+}
+
+const BX = 470;  // left edge of the shell scenes (banner + folder), roughly centred
+
+function landScene(c, t) {  // 10.5 - 14: Enter, banner, the folder changes
+  if (t < K.enter1 + 0.3) {  // the panel wipes away
+    withCam(c, lean(1, 0.35, 0.18), () => drawScreen(c, 'search6', DATA.scenes.search[6], panelX(), panelY()));
+    wipe(c, span(t, K.enter1, K.enter1 + 0.3));
+    return;
+  }
+  prompt(c, t, BX + 30, 250, 34, 'cs', [0, 0], 1);
+  bannerReveal(c, 'banner-resume', DATA.banners.resume, t, 10.85, BX, 270, 1.45);
+  // the shell's folder, before and after
+  const y = 770, a = span(t, 11.2, 11.4);
+  label(c, 'FOLDER', BX + 30, y - 108, GRAY, a);
+  if (a > 0) scramble(c, '~', '~/GitHub/kiosk-ui', t, 11.6, BX + 30, y, 58, NEON);
+  if (t > 11.6) brackets(c, { x: BX + 20, y: y - 58, w: 640, h: 76 }, t, 12.15);
+  captionBand(c, 930, span(t, 11.9, 12.1) * (1 - span(t, 13.8, 14)));
+}
+
+function newScene(c, t) {  // 14 - 18.5
+  const shots = DATA.scenes.new;
+  let i = 0;
+  if (t >= K.tab) i = 1;
+  if (t >= K.open) i = 2;
+  K.downs.forEach((k, j) => { if (t >= k) i = 3 + j; });
+  if (t < K.enter2 + 0.3) {
+    const z = lerp(1, 1.16, ease(span(t, 15.0, 15.7))) - 0.16 * ease(span(t, 16.9, 17.25));
+    withCam(c, lean(z, 0.45, 0.42), () => drawScreen(c, 'new' + i, shots[i], panelX(), panelY()));
+    if (t < 14.12) wipe(c, 1 - span(t, 14.0, 14.12));  // cut in from black
+    captionBand(c, 1010, span(t, 15.1, 15.3) * (1 - span(t, 17.0, 17.25)));
+    wipe(c, span(t, K.enter2, K.enter2 + 0.3));
+    return;
+  }
+  prompt(c, t, BX + 30, 330, 34, 'cs', [0, 0], 1);
+  bannerReveal(c, 'banner-new', DATA.banners.new, t, 17.6, BX, 350, 1.45);
+}
+
+function macsScene(c, t) {  // 18.5 - 24.5: save on this Mac, pick it up on the other one
+  const save = DATA.scenes.save, imp = DATA.scenes.import;
+  let i = 1;
+  if (t >= K.menu) i = 2;
+  if (t >= K.saveDown) i = 3;
+  if (t >= K.saveEnter) i = 4;
+  const gap = 2300;                                                  // the other Mac sits to the right
+  const pan = ease(span(t, K.whipA, K.whipB));
+  const zoomB = t > K.whipB ? 1 + 0.16 * ease(span(t, 21.5, 22.3)) * (1 - span(t, 22.6, 22.75)) : 1;
+  // slide from this Mac's framing to the other Mac's
+  // this Mac: lean into the menu, then down to the "Saved…" note
+  const onMenu = lean(1 + 0.22 * ease(span(t, 18.6, 19.0)), 0.36, 0.2), onNote = lean(1.12, 0.5, 0.92);
+  const m = ease(span(t, K.saveEnter, K.saveEnter + 0.45));
+  const camA = { z: lerp(onMenu.z, onNote.z, m), x: lerp(onMenu.x, onNote.x, m), y: lerp(onMenu.y, onNote.y, m) };
+  const camB = lean(zoomB, 0.42, 0.26);
+  camB.x += gap;
+  const cam = { z: lerp(camA.z, camB.z, pan), x: lerp(camA.x, camB.x, pan), y: lerp(camA.y, camB.y, pan) };
+  if (t < K.enter3 + 0.3) {
+    withCam(c, cam, () => {
+      if (pan < 1) drawScreen(c, 'save' + i, save[i], panelX(), panelY());
+      if (pan > 0) drawScreen(c, 'import0', imp[0], panelX() + gap, panelY());
+      // the chat file crossing between the Macs
+      if (t > K.whipA - 0.05 && t < K.whipB + 0.1) {
+        const p = ease(span(t, K.whipA - 0.05, K.whipB + 0.05));
+        const fx = lerp(panelX() + 300, panelX() + gap + 300, p), fy = lerp(panelY() + 31 * LH - 40, panelY() + 8 * LH, p);
+        c.font = `700 30px ${MONO}`; c.textBaseline = 'middle';
+        for (let k = 5; k >= 0; k--) {
+          c.globalAlpha = k ? 0.12 * (6 - k) / 6 : 1;
+          c.fillStyle = ORANGE;
+          c.fillText(`⇣ ${DATA.bundle_name}`, fx - k * 70, fy);
+        }
+        c.globalAlpha = 1;
+      }
+    });
+    if (t < 18.62) wipe(c, 1 - span(t, 18.5, 18.62));
+    captionBand(c, 1010, span(t, 21.35, 21.55) * (1 - span(t, 22.55, 22.75)));
+    // which Mac we're on: bottom-right, clear of the panel framings and the caption
+    label(c, 'THIS MAC', 'right', H - 40, PALE, 1 - span(t, K.whipA, K.whipA + 0.25));
+    label(c, 'YOUR OTHER MAC', 'right', H - 40, ORANGE, span(t, K.whipB - 0.2, K.whipB + 0.1));
+    wipe(c, span(t, K.enter3, K.enter3 + 0.3));
+    return;
+  }
+  prompt(c, t, BX + 30, 330, 34, 'cs', [0, 0], 1);
+  bannerReveal(c, 'banner-import', DATA.banners.import, t, 23.1, BX, 350, 1.45);
+  captionBand(c, 1010, 1 - span(t, 24.2, 24.5));
+  label(c, 'YOUR OTHER MAC', 'right', H - 40, ORANGE, 1 - span(t, 24.2, 24.5));
+}
+
+function endScene(c, t) {  // 24.5 - 30
+  if (t < K.end + 0.3) { wipe(c, 1 - span(t, K.end, K.end + 0.3)); }
+  // the big "cs"
+  c.font = `800 210px ${MONO}`; c.textBaseline = 'alphabetic';
+  const n = K.bigCs.filter(k => t >= k).length, word = 'cs'.slice(0, n);
+  const full = c.measureText('cs').width, x = (W - full) / 2, y = 500;
+  c.fillStyle = NEON; c.fillText(word, x, y);
+  if (t < K.lock2) { const w = c.measureText(word).width; if (Math.floor(t * 4) % 2 === 0 || n < 2) c.fillRect(x + w + 12, y - 165, 110, 190); }
+  brackets(c, { x: x - 30, y: y - 175, w: full + 60, h: 210 }, t, K.lock2);
+}
+
+function drawCaptions(c, t) {
+  for (const [text, t0, cps, x, y, size, color] of CAPTIONS) {
+    const until = { '14 chats.': 3.25, '10 projects.': 3.25, 'Which folder was that one in?': 3.25,
+      'Type to find any chat, in any project.': 10.2, 'Enter. The right chat, in the right folder.': 13.8,
+      'New chat? Pick a folder. Newest first.': 17.05, 'Move a chat to your other Mac.': 24.3 }[text] ?? 99;
+    if (t >= t0 && t < until) typed(c, text, t, t0, cps, x, y, size, color);
+  }
+}
+
+function drawScene(c, t) {
+  c.fillStyle = BG; c.fillRect(0, 0, W, H);
+  c.drawImage(gridBg, -((t * 6) % CW), -((t * 3) % LH));
+  if (t < 3.5) noiseWall(c, t);
+  else if (t < 6.5) summon(c, t);
+  else if (t < 10.5) searchScene(c, t);
+  else if (t < 14.0) landScene(c, t);
+  else if (t < 18.5) newScene(c, t);
+  else if (t < 24.5) macsScene(c, t);
+  else endScene(c, t);
+  drawCaptions(c, t);
+  if (t >= 3.25 && t < 3.5) wipe(c, span(t, 3.25, 3.5));
+  if (t >= 29.6) wipe(c, span(t, 29.6, 30));
+}
+
+// key presses and hits make the glow pulse
+const PULSES = [...K.cs, K.csEnter, ...K.search, K.down1, K.enter1, K.tab, K.open, ...K.downs, K.enter2,
+                K.menu, K.saveDown, K.saveEnter, K.enter3, ...K.bigCs].map(t => [t, 0.18])
+               .concat([[K.lock1, 0.55], [K.lock2, 0.6], [12.15, 0.3]]);
+const glowAt = t => 0.34 + PULSES.reduce((s, [k, a]) => s + (t >= k ? a * Math.exp(-(t - k) * 9) : 0), 0);
+
+function renderTime(t) {
+  const blur = t > K.whipA + 0.05 && t < K.whipB - 0.05;  // motion blur for the whip pan only
+  if (blur) {
+    const N = 8;
+    for (let i = 0; i < N; i++) {
+      drawScene(sc, t + (i / N - 0.5) * (1.6 / FPS));
+      ac.globalAlpha = 1 / (i + 1); ac.drawImage(scene, 0, 0);
+    }
+    ac.globalAlpha = 1;
+    sc.drawImage(acc, 0, 0);
+  } else {
+    drawScene(sc, t);
+  }
+  out.globalCompositeOperation = 'source-over'; out.filter = 'none'; out.globalAlpha = 1;
+  out.drawImage(scene, 0, 0);
+  // bloom: the phosphor glow
+  out.globalCompositeOperation = 'lighter';
+  out.filter = 'blur(9px)'; out.globalAlpha = Math.min(0.85, glowAt(t)); out.drawImage(scene, 0, 0);
+  out.filter = 'blur(28px)'; out.globalAlpha = Math.min(0.5, glowAt(t) * 0.6); out.drawImage(scene, 0, 0);
+  out.filter = 'none'; out.globalAlpha = 1; out.globalCompositeOperation = 'source-over';
+  out.drawImage(scanlines, 0, 0);
+  out.drawImage(vignette, 0, 0);
+}
+
+// ---- score (Web Audio, rendered offline; same timeline) ---------------------------------
+function mulberry(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let x = Math.imul(seed ^ seed >>> 15, 1 | seed);
+  x = x + Math.imul(x ^ x >>> 7, 61 | x) ^ x; return ((x ^ x >>> 14) >>> 0) / 4294967296; }; }
+async function renderAudio() {
+  const SR = 44100, ctxA = new OfflineAudioContext(2, SR * DURATION, SR);
+  const rnd = mulberry(7);
+  const noise = ctxA.createBuffer(1, SR * 2, SR); const nd = noise.getChannelData(0);
+  for (let i = 0; i < nd.length; i++) nd[i] = rnd() * 2 - 1;
+  // master: glue compressor, then a fast limiter
+  const master = ctxA.createGain(); master.gain.value = 0.55;
+  const glue = new DynamicsCompressorNode(ctxA, { threshold: -18, ratio: 3, attack: 0.005, release: 0.25, knee: 6 });
+  const lim = new DynamicsCompressorNode(ctxA, { threshold: -4, ratio: 20, attack: 0.001, release: 0.06, knee: 0 });
+  master.connect(glue).connect(lim).connect(ctxA.destination);
+  master.gain.setValueAtTime(0.55, 29.2); master.gain.linearRampToValueAtTime(0.0001, 30);
+  // reverb send
+  const ir = ctxA.createBuffer(2, SR * 2.4, SR);
+  for (let ch = 0; ch < 2; ch++) { const d = ir.getChannelData(ch); for (let i = 0; i < d.length; i++) d[i] = (rnd() * 2 - 1) * Math.pow(1 - i / d.length, 3.2); }
+  const verb = new ConvolverNode(ctxA, { buffer: ir }), verbGain = ctxA.createGain(); verbGain.gain.value = 0.32;
+  verb.connect(verbGain).connect(master);
+  const send = (node, amt) => { const g = ctxA.createGain(); g.gain.value = amt; node.connect(g).connect(verb); };
+
+  const env = (g, t, a, peak, d, sustain = 0.0001) => {
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(peak, t + a);
+    g.gain.exponentialRampToValueAtTime(Math.max(sustain, 0.0001), t + a + d);
+  };
+  const noiseSrc = (t, dur, off = 0) => { const s = new AudioBufferSourceNode(ctxA, { buffer: noise, loop: true });
+    s.start(t, off % 1.9); s.stop(t + dur); return s; };
+  const kick = (t, amt = 0.9) => {
+    const o = new OscillatorNode(ctxA, { frequency: 140 }), g = ctxA.createGain();
+    o.frequency.setValueAtTime(140, t); o.frequency.exponentialRampToValueAtTime(42, t + 0.14);
+    env(g, t, 0.003, amt, 0.38); o.connect(g).connect(master); o.start(t); o.stop(t + 0.45);
+  };
+  const hat = (t, amt = 0.08, open = false) => {
+    const s = noiseSrc(t, open ? 0.2 : 0.05, t * 7.3), f = new BiquadFilterNode(ctxA, { type: 'highpass', frequency: 7500 }), g = ctxA.createGain();
+    env(g, t, 0.001, amt, open ? 0.18 : 0.035); s.connect(f).connect(g).connect(master);
+  };
+  const clap = (t, amt = 0.32) => {
+    const s = noiseSrc(t, 0.25, t * 3.1), f = new BiquadFilterNode(ctxA, { type: 'bandpass', frequency: 1700, Q: 0.9 }), g = ctxA.createGain();
+    env(g, t, 0.002, amt, 0.16); s.connect(f).connect(g).connect(master); send(g, 0.6);
+  };
+  const key = (t, amt = 0.22, seed = 0) => {
+    const s = noiseSrc(t, 0.04, t * 11 + seed), f = new BiquadFilterNode(ctxA, { type: 'bandpass', frequency: 2600 + hash(seed + Math.round(t * 1000)) * 2200, Q: 2.2 }), g = ctxA.createGain();
+    env(g, t, 0.001, amt, 0.022); s.connect(f).connect(g).connect(master);
+  };
+  const tone = (t, freq, dur, amt, type = 'sine', wet = 0.3, a = 0.004) => {
+    const o = new OscillatorNode(ctxA, { type, frequency: freq }), g = ctxA.createGain();
+    env(g, t, a, amt, dur); o.connect(g).connect(master); if (wet) send(g, wet); o.start(t); o.stop(t + a + dur + 0.05);
+  };
+  const blip = t => { tone(t, 1320, 0.07, 0.07, 'sine', 0.4); tone(t + 0.035, 1760, 0.06, 0.05, 'sine', 0.4); };
+  const pluck = (t, freqs, amt = 0.09) => freqs.forEach((f, i) => tone(t + i * 0.012, f, 0.55, amt, 'triangle', 0.5));
+  const sweep = (t0, t1, f0, f1, amt, panFrom = 0, panTo = 0) => {
+    const s = noiseSrc(t0, t1 - t0 + 0.1, t0), f = new BiquadFilterNode(ctxA, { type: 'bandpass', frequency: f0, Q: 1.4 }), g = ctxA.createGain();
+    const p = new StereoPannerNode(ctxA, { pan: panFrom });
+    f.frequency.setValueAtTime(f0, t0); f.frequency.exponentialRampToValueAtTime(f1, t1);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amt, t1 - 0.05); g.gain.exponentialRampToValueAtTime(0.0001, t1 + 0.08);
+    p.pan.setValueAtTime(panFrom, t0); p.pan.linearRampToValueAtTime(panTo, t1);
+    s.connect(f).connect(g).connect(p).connect(master); send(g, 0.3);
+  };
+  const sub = (t, amt = 0.7) => { tone(t, 55, 1.4, amt, 'sine', 0); };
+  const lockHit = t => { kick(t, 1); sub(t, 0.6); pluck(t, [220, 261.6, 329.6, 493.9], 0.11); clap(t, 0.25); hat(t, 0.1, true); };
+  const pad = (t0, t1, freqs, amt = 0.03) => freqs.forEach(fr => [-7, 7].forEach(det => {
+    const o = new OscillatorNode(ctxA, { type: 'sawtooth', frequency: fr, detune: det }), f = new BiquadFilterNode(ctxA, { type: 'lowpass', frequency: 1100, Q: 0.3 }), g = ctxA.createGain();
+    g.gain.setValueAtTime(0.0001, t0); g.gain.linearRampToValueAtTime(amt, t0 + 0.35); g.gain.setValueAtTime(amt, t1 - 0.3); g.gain.linearRampToValueAtTime(0.0001, t1 + 0.2);
+    o.connect(f).connect(g).connect(master); send(g, 0.7); o.start(t0); o.stop(t1 + 0.3);
+  }));
+  const bassNote = (t, freq, amt = 0.2) => {
+    const o = new OscillatorNode(ctxA, { type: 'sawtooth', frequency: freq }), f = new BiquadFilterNode(ctxA, { type: 'lowpass', frequency: 520, Q: 2 }), g = ctxA.createGain();
+    f.frequency.setValueAtTime(900, t); f.frequency.exponentialRampToValueAtTime(240, t + 0.25);
+    env(g, t, 0.004, amt, 0.32); o.connect(f).connect(g).connect(master); o.start(t); o.stop(t + 0.4);
+  };
+
+  // intro: drone, tension, ticking
+  [55, 82.41].forEach(f => { const o = new OscillatorNode(ctxA, { frequency: f }), g = ctxA.createGain();
+    g.gain.setValueAtTime(0.0001, 0); g.gain.linearRampToValueAtTime(0.14, 0.6); g.gain.setValueAtTime(0.14, 5.4); g.gain.linearRampToValueAtTime(0.0001, 6.1);
+    o.connect(g).connect(master); o.start(0); o.stop(6.2); });
+  { const o = new OscillatorNode(ctxA, { frequency: 659.3 }), lfo = new OscillatorNode(ctxA, { frequency: 5.5 }), lg = ctxA.createGain(), g = ctxA.createGain();
+    lg.gain.value = 6; lfo.connect(lg).connect(o.frequency);
+    g.gain.setValueAtTime(0.0001, 0.4); g.gain.linearRampToValueAtTime(0.022, 1.6); g.gain.linearRampToValueAtTime(0.0001, 3.4);
+    o.connect(g).connect(master); send(g, 0.6); o.start(0.4); lfo.start(0.4); o.stop(3.5); lfo.stop(3.5); }
+  for (let t = 0.25; t < 3.25; t += 0.125) hat(t, (Math.round(t * 8) % 4 === 0) ? 0.06 : 0.03);
+  // build: typing, then a riser into the lock
+  sweep(K.csEnter, K.lock1, 300, 7000, 0.22);
+  lockHit(K.lock1);
+  // groove 6 - 24.5: Am F C G, a bar (2 s) each
+  const chords = [[220, 261.6, 329.6], [174.6, 220, 261.6], [261.6, 329.6, 392], [196, 246.9, 293.7]];
+  const roots = [55, 43.65, 65.41, 49];
+  for (let bar = 0; bar < 9; bar++) {
+    const t0 = 6 + bar * 2, ci = bar % 4;
+    if (t0 >= 24.5) break;
+    pad(t0, Math.min(t0 + 2, 24.5), chords[ci], 0.022);
+    for (let b = 0; b < 4; b++) {
+      const t = t0 + b * 0.5;
+      if (t >= 24.5) break;
+      if (!(t > K.enter1 - 0.01 && t < K.enter1 + 0.4)) kick(t, 0.75);
+      hat(t + 0.25, 0.08);
+      hat(t + 0.125, 0.025); hat(t + 0.375, 0.025);
+      if (b % 2 === 1 && t >= 8) clap(t, 0.2);
+      bassNote(t, roots[ci], 0.2); bassNote(t + 0.25, roots[ci] * 2, 0.09);
+    }
+  }
+  // the tail: breakdown, the last lock, ring out
+  pad(24.5, 29.8, [220, 261.6, 329.6, 493.9], 0.02);
+  sweep(24.6, K.lock2, 400, 5000, 0.15);
+  lockHit(K.lock2);
+  for (let t = K.lock2 + 0.5; t < 29.3; t += 0.5) { kick(t, 0.32); hat(t + 0.25, 0.04); }
+  // interface sounds, on the same beats as the picture
+  K.cs.forEach((t, i) => key(t, 0.3, i));
+  key(K.csEnter, 0.32, 9); tone(K.csEnter, 880, 0.12, 0.05, 'sine', 0.4);
+  K.search.forEach((t, i) => key(t, 0.28, 20 + i));
+  [K.down1, K.tab, K.open, ...K.downs, K.menu, K.saveDown].forEach(blip);
+  [K.enter1, K.enter2, K.saveEnter, K.enter3].forEach((t, i) => { key(t, 0.3, 40 + i); pluck(t, chords[i % 4].map(f => f * 2), 0.07); clap(t, 0.26); });
+  sweep(K.whipA - 0.1, K.whipB, 2600, 380, 0.3, -0.9, 0.9);
+  K.bigCs.forEach((t, i) => key(t, 0.34, 60 + i));
+  for (const [text, t0, cps] of CAPTIONS) charTimes(text, t0, cps).forEach(([t], i) => { if (i % 2 === 0) key(t, 0.07, i + t0 * 100); });
+  tone(12.15, 1046.5, 0.5, 0.05, 'sine', 0.6);  // the folder settles
+
+  const buf = await ctxA.startRendering();
+  return toWavBase64(buf);
+}
+function toWavBase64(buf) {
+  const ch = buf.numberOfChannels, len = buf.length, bytes = new DataView(new ArrayBuffer(44 + len * ch * 2));
+  const w = (o, s) => [...s].forEach((c, i) => bytes.setUint8(o + i, c.charCodeAt(0)));
+  w(0, 'RIFF'); bytes.setUint32(4, 36 + len * ch * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
+  bytes.setUint32(16, 16, true); bytes.setUint16(20, 1, true); bytes.setUint16(22, ch, true);
+  bytes.setUint32(24, buf.sampleRate, true); bytes.setUint32(28, buf.sampleRate * ch * 2, true);
+  bytes.setUint16(32, ch * 2, true); bytes.setUint16(34, 16, true); w(36, 'data'); bytes.setUint32(40, len * ch * 2, true);
+  const data = [...Array(ch)].map((_, i) => buf.getChannelData(i));
+  let o = 44;
+  for (let i = 0; i < len; i++) for (let c = 0; c < ch; c++) { bytes.setInt16(o, Math.max(-1, Math.min(1, data[c][i])) * 32767, true); o += 2; }
+  const u8 = new Uint8Array(bytes.buffer); let s = '';
+  for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+// ---- setup ---------------------------------------------------------------------------------
+async function setup() {
+  DATA = await (await fetch('frames.json')).json();
+  await Promise.all(['400', '600', '700', '800'].map(w => document.fonts.load(`${w} 22px ${MONO}`)));
+  out.font = `400 ${FS}px ${MONO}`; CW = out.measureText('M').width;
+  gridBg = mk(W + 2 * CW, H + 2 * LH); const g = gridBg.getContext('2d');
+  g.fillStyle = '#0c1d10';
+  for (let y = 0; y < gridBg.height; y += LH) for (let x = 0; x < gridBg.width; x += CW) g.fillRect(x + CW / 2, y + LH / 2, 1.4, 1.4);
+  vignette = mk(W, H); const v = vignette.getContext('2d'), rg = v.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, H * 0.95);
+  rg.addColorStop(0, 'rgba(0,0,0,0)'); rg.addColorStop(1, 'rgba(0,0,0,0.6)'); v.fillStyle = rg; v.fillRect(0, 0, W, H);
+  scanlines = mk(W, H); const s = scanlines.getContext('2d'); s.fillStyle = 'rgba(0,0,0,0.12)';
+  for (let y = 0; y < H; y += 3) s.fillRect(0, y, W, 1);
+}
+window.FILM = { W, H, FPS, DURATION, ready: setup(), renderTime, renderAudio };
+</script>
+</body>
+</html>
