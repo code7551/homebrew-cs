@@ -2,13 +2,15 @@
 """Pick a Claude Code chat session and resume it.
 
 Type to search project names and chat titles. ↑↓ select, Enter resume,
-← → change page, Esc clears the search (or quits when it is empty).
+→ menu for the selected chat (resume, or save it for another Mac), ← and
+fn+↑↓ change page, Esc clears the search (or quits when it is empty).
 
 "+ New session" (or Tab) opens a folder browser: ↑↓ select, → open a folder,
 ← go up, Enter start a new session in the highlighted folder. Type to filter
 folders, or type a name and pick "+ create folder" to make a new one.
 
-Move a chat to another Mac: select it and press Ctrl-E. It is saved as
+Move a chat to another Mac: select it, press → and pick "Save for another
+Mac" (or just press Ctrl-E). It is saved as
 ~/Downloads/<project>-<id>.claude-session; AirDrop (or copy) that file over.
 On the other Mac it shows up at the top of `cs` (or run `cs import <file>`);
 Enter imports it into that project's folder and resumes it.
@@ -187,6 +189,10 @@ def session_files(r):
     return [(p, a, os.path.getsize(p)) for p, a in out]
 
 
+def bundle_name(r):
+    return re.sub(r"[^A-Za-z0-9._-]", "-", project(r)) + f"-{r['id'][:8]}{BUNDLE_EXT}"
+
+
 def export_session(r, progress):
     """Pack a chat into ~/Downloads/<project>-<id>.claude-session; return its path."""
     files = session_files(r)
@@ -194,8 +200,7 @@ def export_session(r, progress):
     manifest = {"format": "claude-session", "version": 1, "id": r["id"],
                 "title": r["title"], "cwd": r["cwd"], "home": os.path.expanduser("~"),
                 "size": r["size"], "bytes": progress["total"], "exported": time.time()}
-    name = re.sub(r"[^A-Za-z0-9._-]", "-", project(r)) + f"-{r['id'][:8]}{BUNDLE_EXT}"
-    dest = os.path.join(DOWNLOADS, name)
+    dest = os.path.join(DOWNLOADS, bundle_name(r))
     os.makedirs(DOWNLOADS, exist_ok=True)
     tmp = dest + ".part"
     try:
@@ -508,9 +513,15 @@ FOLDER_COLUMNS = [("label", "FOLDER", 0, PALE, True, False),
                   ("when", "LAST ACTIVE", 16, GRAY, False, False)]
 
 
+ACTION_COLUMNS = [("label", "ACTION", 26, PALE, False, False),
+                  ("detail", "", 0, GRAY, False, False)]
+
+
 def row_values(r):
     if r.get("kind") == "newsession":
         return {"when": r["title"], "project": "", "title": ""}
+    if r.get("kind", "").startswith("act-"):  # a line of a chat's menu
+        return {"label": r["label"], "detail": r.get("detail", "")}
     if r.get("kind") == "incoming":  # a chat file from another Mac
         return {"when": "⇣ import", "project": project(r), "title": r["title"]}
     if "label" in r:  # a row of the folder browser
@@ -541,7 +552,8 @@ def size_columns(spec, drop, items, inner):
 
 
 def show_page(*, view, items, spec, drop, page, pages, cursor, per_page, query,
-              count, placeholder, empty, details, hints, note, tab2="[ NEW SESSION ]"):
+              count, placeholder, empty, details, hints, note, tab2="[ NEW SESSION ]",
+              heading=None):
     """Draw one page as a panel centered in the terminal."""
     cols, _ = shutil.get_terminal_size()
     inner = max(56, min(MAX_WIDTH, cols - 4))  # columns inside the border
@@ -566,9 +578,12 @@ def show_page(*, view, items, spec, drop, page, pages, cursor, per_page, query,
 
     # Search box, with the count on the right.
     shown_query = query if cells(query) <= inner - 30 else fit(query, inner - 30, True)
-    box = [("  ❯ ", GREEN), (shown_query, BRIGHT), ("█", BRIGHT)]
-    if not query:
-        box.append((placeholder, GRAY))
+    if heading:  # a chat's menu: its name instead of the search box
+        box = [("  ❯ ", GREEN), (fit(heading, inner - 6).rstrip(), BRIGHT)]
+    else:
+        box = [("  ❯ ", GREEN), (shown_query, BRIGHT), ("█", BRIGHT)]
+        if not query:
+            box.append((placeholder, GRAY))
     gap = inner - sum(cells(t) for t, _ in box) - cells(count) - 2
     out += [line(*box, (" " * max(1, gap), ""), (count + "  ", GRAY)), line()]
 
@@ -599,7 +614,7 @@ def show_page(*, view, items, spec, drop, page, pages, cursor, per_page, query,
                    if label else line())
     out.append(line(("  ! ", WARN), (fit(note, inner - 5), WARN))
                if note else line())
-    for drop_hint in ("←→ page", "↑↓ select", "^E export", "tab sessions", "tab new session"):
+    for drop_hint in ("fn↑↓ page", "↑↓ select", "→ menu", "tab sessions", "tab new session"):
         if cells("─".join(f"[{h}]" for h in hints)) <= inner - 2:
             break  # fewer hints on a narrow terminal
         hints = [h for h in hints if h != drop_hint]
@@ -633,7 +648,8 @@ def read_key(fd):
             seq += b
             if 0x40 <= b[0] <= 0x7E:  # final byte of the sequence
                 break
-        return {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}.get(seq, "")
+        return {b"A": "up", b"B": "down", b"C": "right", b"D": "left",
+            b"5~": "pgup", b"6~": "pgdn"}.get(seq, "")
     # Read the rest of a multi-byte UTF-8 character (Thai letters are 3 bytes).
     lead = ch[0]
     extra = 1 if 0xC0 <= lead < 0xE0 else 2 if 0xE0 <= lead < 0xF0 else 3 if 0xF0 <= lead < 0xF8 else 0
@@ -656,6 +672,8 @@ def key_action():
         k = read_key(fd)
         if k in ("up", "down", "esc"):
             return k
+        if k in ("pgup", "pgdn"):
+            return {"pgup": "pageup", "pgdn": "pagedown"}[k]
         if k == "right":
             return "next"
         if k == "left":
@@ -687,6 +705,7 @@ def line_action():
     line = input()
     names = {"up": "up", "down": "down", "right": "next", "left": "prev",
              "tab": "tab", "esc": "esc", "bs": "backspace", "export": "export",
+             "pgup": "pageup", "pgdn": "pagedown",
              "": "enter"}
     return names.get(line, ("text", line))
 
@@ -703,6 +722,20 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
     start = os.getcwd()
     location = None  # folder browser: None is its start page
     page, cursor, note, focus = 0, 0, "", None
+    menu, back_to = None, (0, 0)  # the chat whose menu is open, list position
+
+    def save(chat):
+        """Export a chat for another Mac; returns the note to show."""
+        progress = {"done": 0, "total": 0}
+        try:
+            with Loading(progress, "packing chat for another Mac", unit="MB"):
+                dest = export_session(chat, progress)
+        except OSError as e:
+            return f"Couldn't save it: {e.strerror or e}"
+        if TTY:
+            subprocess.run(["open", "-R", dest], check=False)  # show in Finder
+        return (f"Saved {os.path.basename(dest)} ({human(os.path.getsize(dest))}) "
+                "to Downloads. AirDrop it to your other Mac.")
 
     def unpack(m, target):
         progress = {"done": 0, "total": 0}
@@ -729,6 +762,13 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
             found = ([r for r in rows if all(w in haystack(r) for w in words)]
                      if words else list(incoming) + [NEW_ROW] + rows)
             count = f"{len(found)} of {len(rows)} sessions" if words else f"{len(rows)} sessions"
+        elif view == "menu":
+            found = [{"kind": "act-resume", "label": "↻ Resume chat", "style": BRIGHT,
+                      "detail": "(Enter on the list does this too)"},
+                     {"kind": "act-export", "label": "⇪ Save for another Mac",
+                      "detail": f"→ ~/Downloads/{bundle_name(menu)}   (shortcut: Ctrl-E)"},
+                     {"kind": "act-back", "label": "← Back", "style": GRAY}]
+            count = ""
         else:
             found = explorer_items(location, query, recent, start)
             folders = sum(1 for r in found if r["kind"] == "dir")
@@ -753,10 +793,15 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
             else:
                 details = [("dir", sel["cwd"]), ("id", sel["id"])] if sel else [("", ""), ("", "")]
             enter = {"newsession": "⏎ new session", "incoming": "⏎ import"}.get(kind_, "⏎ resume")
-            hints = ["↑↓ select", enter] + ([] if kind_ else ["^E export"])
-            hints += ["tab new session"] + (["←→ page"] if pages > 1 else [])
+            hints = ["↑↓ select", enter] + ([] if kind_ else ["→ menu"])
+            hints += ["tab new session"] + (["fn↑↓ page"] if pages > 1 else [])
             hints.append("esc clear" if query else "esc quit")
             placeholder = " type to search projects and titles"
+        elif view == "menu":
+            spec, drop = ACTION_COLUMNS, []
+            details = [("dir", menu["cwd"]), ("id", menu["id"])]
+            hints = ["↑↓ select", "⏎ choose", "← back", "esc back"]
+            placeholder = ""
         else:
             spec, drop = FOLDER_COLUMNS, ["chats", "when"]
             details = [("dir", sel["cwd"] if sel else ""),
@@ -774,7 +819,8 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
                       count=count, placeholder=placeholder,
                       empty=f'no sessions match "{query}"', details=details,
                       hints=hints, note=note,
-                      tab2="[ IMPORT TO… ]" if importing else "[ NEW SESSION ]")
+                      tab2="[ IMPORT TO… ]" if importing else "[ NEW SESSION ]",
+                      heading=f"{project(menu)} · {menu['title']}" if view == "menu" else None)
             note = ""
         try:
             action = next_action()
@@ -788,6 +834,20 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
 
         if kind == "quit":
             return None
+        if view == "menu":  # a chat's menu: resume, save for another Mac, back
+            pressed = kind in ("enter", "next")
+            if kind in ("esc", "prev") or (pressed and kind_ == "act-back"):
+                view, menu, (page, cursor) = "sessions", None, back_to
+            elif pressed and kind_ == "act-resume":
+                return ("resume", menu)
+            elif kind == "export" or (pressed and kind_ == "act-export"):
+                note = save(menu)
+                view, menu, (page, cursor) = "sessions", None, back_to
+            elif kind == "down" and cursor < len(page_rows) - 1:
+                cursor += 1
+            elif kind == "up" and cursor:
+                cursor -= 1
+            continue
         if kind == "esc":
             if query:
                 query, page, cursor = "", 0, 0
@@ -800,18 +860,9 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
             query, page, cursor, importing = "", 0, 0, None
         elif kind == "export":
             if view != "sessions" or not sel or kind_:
-                note = "Select a chat, then press Ctrl-E to save it for another Mac."
+                note = "Select a chat, then press → (or Ctrl-E) to save it for another Mac."
             else:
-                progress = {"done": 0, "total": 0}
-                try:
-                    with Loading(progress, "packing chat for another Mac", unit="MB"):
-                        dest = export_session(sel, progress)
-                    note = (f"Saved {os.path.basename(dest)} ({human(os.path.getsize(dest))}) "
-                            "to Downloads. AirDrop it to your other Mac.")
-                    if TTY:
-                        subprocess.run(["open", "-R", dest], check=False)  # show in Finder
-                except OSError as e:
-                    note = f"Couldn't save it: {e.strerror or e}"
+                note = save(sel)
         elif kind == "enter" and sel:
             if kind_ == "newsession":
                 view = "new"
@@ -854,6 +905,9 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
                 # Open a folder (on the start page, the current folder too).
                 if kind_ in ("dir", "up") or (kind_ == "here" and location is None):
                     go(sel["cwd"], came_from=location if kind_ == "up" else None)
+            elif sel and not kind_:  # a chat: open its menu
+                back_to, menu, view = (page, cursor), sel, "menu"
+                page, cursor = 0, 0
             elif page < pages - 1:
                 page, cursor = page + 1, 0
             else:
@@ -870,6 +924,12 @@ def pick(rows, recent, per_page, query, view, next_action, waiting,
                 page, cursor = page - 1, 0
             else:
                 note = "This is the first page."
+        elif kind == "pagedown":
+            if page < pages - 1:
+                page, cursor = page + 1, 0
+        elif kind == "pageup":
+            if page:
+                page, cursor = page - 1, 0
         elif kind == "text":
             query, page, cursor = query + text, 0, 0
         elif kind == "backspace":

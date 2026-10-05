@@ -52,8 +52,9 @@ Needs zsh and the `claude` CLI. It uses the Python 3 that comes with macOS (`/us
 | type | Search project names and chat titles |
 | ↑ ↓ | Move the selection |
 | Enter | Resume the selected chat in its project folder |
-| Ctrl-E | Export the selected chat to move to another Mac (see below) |
-| ← → | Previous / next page |
+| → | Menu for the selected chat: resume it, or save it for another Mac |
+| Ctrl-E | Save the selected chat for another Mac (shortcut, see below) |
+| ← / fn+↑ fn+↓ | Previous page / page up and down |
 | Backspace, Ctrl-U | Delete a character / clear the search |
 | Esc | Clear the search, or quit if it is empty |
 
@@ -79,7 +80,8 @@ cs -n 20      # 20 per page (default 25, fewer on short windows)
 
 ## Move a chat to another Mac
 
-1. On this Mac, run `cs`, select the chat and press **Ctrl-E**. It's saved as
+1. On this Mac, run `cs`, select the chat, press **→** and choose
+   **Save for another Mac** (or just press **Ctrl-E**). It's saved as
    `~/Downloads/<project>-<id>.claude-session` and shown in Finder.
 2. AirDrop (or copy) that file to the other Mac's Downloads folder.
 3. On the other Mac, run `cs`. The chat is at the top as `⇣ import`; press
