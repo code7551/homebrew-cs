@@ -1,8 +1,8 @@
 class Cs < Formula
   desc "Searchable picker that resumes Claude Code chats in their project folder"
   homepage "https://github.com/code7551/homebrew-cs"
-  url "https://github.com/code7551/homebrew-cs/archive/refs/tags/v1.1.0.tar.gz"
-  sha256 "53988578d03a5a1d1e5af03345b7f6e9ef494c651941be3977ca09d3b260b163"
+  url "https://github.com/code7551/homebrew-cs/archive/refs/tags/v1.2.0.tar.gz"
+  sha256 "fcf24b4bbd787375f1400a94235f77f98833b3e27fa2551a71fd0c49ac2385c7"
 
   def install
     bin.install "claude-sessions"
